@@ -289,6 +289,7 @@ StringRef Triple::getOSTypeName(OSType Kind) {
   case OpenBSD: return "openbsd";
   case PS4: return "ps4";
   case PS5: return "ps5";
+  case RISCovite: return "riscovite";
   case RTEMS: return "rtems";
   case Solaris: return "solaris";
   case Serenity: return "serenity";
@@ -656,6 +657,7 @@ static Triple::OSType parseOS(StringRef OSName) {
     .StartsWith("macos", Triple::MacOSX)
     .StartsWith("netbsd", Triple::NetBSD)
     .StartsWith("openbsd", Triple::OpenBSD)
+    .StartsWith("riscovite", Triple::RISCovite)
     .StartsWith("solaris", Triple::Solaris)
     .StartsWith("uefi", Triple::UEFI)
     .StartsWith("win32", Triple::Win32)

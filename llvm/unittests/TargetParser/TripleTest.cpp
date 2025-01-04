@@ -768,6 +768,18 @@ TEST(TripleTest, ParsedIDs) {
   EXPECT_EQ(Triple::Haiku, T.getOS());
   EXPECT_EQ(Triple::UnknownEnvironment, T.getEnvironment());
 
+  T = Triple("riscv64-unknown-riscovite");
+  EXPECT_EQ(Triple::riscv64, T.getArch());
+  EXPECT_EQ(Triple::UnknownVendor, T.getVendor());
+  EXPECT_EQ(Triple::RISCovite, T.getOS());
+  EXPECT_EQ(Triple::UnknownEnvironment, T.getEnvironment());
+
+  T = Triple("riscv64-unknown-riscovite-llvm");
+  EXPECT_EQ(Triple::riscv64, T.getArch());
+  EXPECT_EQ(Triple::UnknownVendor, T.getVendor());
+  EXPECT_EQ(Triple::RISCovite, T.getOS());
+  EXPECT_EQ(Triple::LLVM, T.getEnvironment());
+
   T = Triple("mips-mti-linux-gnu");
   EXPECT_EQ(Triple::mips, T.getArch());
   EXPECT_EQ(Triple::MipsTechnologies, T.getVendor());

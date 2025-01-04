@@ -210,6 +210,7 @@ public:
     MacOSX,
     NetBSD,
     OpenBSD,
+    RISCovite,
     Solaris,
     UEFI,
     Win32,
@@ -596,6 +597,8 @@ public:
   }
 
   bool isOSDragonFly() const { return getOS() == Triple::DragonFly; }
+
+  bool isOSRISCovite() const { return getOS() == Triple::RISCovite; }
 
   bool isOSSolaris() const {
     return getOS() == Triple::Solaris;
