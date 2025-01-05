@@ -454,6 +454,9 @@ std::unique_ptr<TargetInfo> AllocateTarget(const llvm::Triple &Triple,
     case llvm::Triple::Haiku:
       return std::make_unique<HaikuTargetInfo<RISCV64TargetInfo>>(Triple,
                                                                   Opts);
+    case llvm::Triple::RISCovite:
+      return std::make_unique<RISCoviteTargetInfo<RISCV64TargetInfo>>(Triple,
+                                                                  Opts);
     case llvm::Triple::Linux:
       switch (Triple.getEnvironment()) {
       default:
