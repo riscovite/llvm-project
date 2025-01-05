@@ -555,6 +555,29 @@ public:
   using PSOSTargetInfo<Target>::PSOSTargetInfo;
 };
 
+// RISCovite Target
+template <typename Target>
+class LLVM_LIBRARY_VISIBILITY RISCoviteTargetInfo : public OSTargetInfo<Target> {
+protected:
+  void getOSDefines(const LangOptions &Opts, const llvm::Triple &Triple,
+                    MacroBuilder &Builder) const override {
+    Builder.defineMacro("__RISCovite__");
+    if (Opts.POSIXThreads)
+      Builder.defineMacro("_REENTRANT");
+    // Required by the libc++ locale support.
+    if (Opts.CPlusPlus)
+      Builder.defineMacro("_GNU_SOURCE");
+    this->PlatformName = "riscovite";
+  }
+
+public:
+  RISCoviteTargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts)
+      : OSTargetInfo<Target>(Triple, Opts) {
+    this->WIntType = TargetInfo::UnsignedInt;
+    this->TheCXXABI.set(TargetCXXABI::GenericItanium);
+  }
+};
+
 // RTEMS Target
 template <typename Target>
 class LLVM_LIBRARY_VISIBILITY RTEMSTargetInfo : public OSTargetInfo<Target> {

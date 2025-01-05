@@ -41,6 +41,7 @@
 #include "ToolChains/PPCFreeBSD.h"
 #include "ToolChains/PPCLinux.h"
 #include "ToolChains/PS4CPU.h"
+#include "ToolChains/RISCovite.h"
 #include "ToolChains/RISCVToolchain.h"
 #include "ToolChains/SPIRV.h"
 #include "ToolChains/SPIRVOpenMP.h"
@@ -6488,6 +6489,9 @@ const ToolChain &Driver::getToolChain(const ArgList &Args,
       break;
     case llvm::Triple::Fuchsia:
       TC = std::make_unique<toolchains::Fuchsia>(*this, Target, Args);
+      break;
+    case llvm::Triple::RISCovite:
+      TC = std::make_unique<toolchains::RISCovite>(*this, Target, Args);
       break;
     case llvm::Triple::Solaris:
       TC = std::make_unique<toolchains::Solaris>(*this, Target, Args);
