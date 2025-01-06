@@ -13,6 +13,8 @@
 
 #if defined(LIBC_TARGET_ARCH_IS_GPU)
 #include "gpu/app.h"
+#elif defined(__RISCovite__)
+#include "riscovite/app.h"
 #elif defined(__linux__)
 #include "linux/app.h"
 #endif

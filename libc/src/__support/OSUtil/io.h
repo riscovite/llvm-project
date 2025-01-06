@@ -19,6 +19,8 @@
 #include "linux/io.h"
 #elif defined(__Fuchsia__)
 #include "fuchsia/io.h"
+#elif defined(__RISCovite__)
+#include "riscovite/io.h"
 #elif defined(_WIN32)
 #include "windows/io.h"
 #elif defined(__ELF__)
