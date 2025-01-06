@@ -1,7 +1,7 @@
 add_header_library(
-  app_h
+  riscovite_riscv_util
   HDRS
-    app.h
+    syscall.h
   DEPENDS
     libc.src.__support.common
 )
