@@ -376,6 +376,21 @@ macro(construct_compiler_rt_default_triple)
     set(COMPILER_RT_DEFAULT_TARGET_TRIPLE ${LLVM_TARGET_TRIPLE} CACHE STRING
           "Default triple for which compiler-rt runtimes will be built.")
   endif()
+  # apparentlymart riscovite HACK: For some reason the above isn't ending up
+  # with any useful value in COMPILER_RT_DEFAULT_TARGET_TRIPLE when building
+  # for "riscv64-unknown-riscovite", so the following forces it to follow
+  # LLVM_TARGET_TRIPLE as a last resort. This is probably not actually a
+  # sensible thing to do, but I've added this to unblock myself in the hope
+  # of learning more about this build system later.
+  if(NOT COMPILER_RT_DEFAULT_TARGET_TRIPLE)
+    if ("${CMAKE_C_COMPILER_TARGET}" STREQUAL "")
+      message(STATUS "forcing COMPILER_RT_DEFAULT_TARGET_TRIPLE as `${LLVM_TARGET_TRIPLE}` (LLVM target triple) as a last resort")
+      set(COMPILER_RT_DEFAULT_TARGET_TRIPLE ${LLVM_TARGET_TRIPLE})
+    else()
+      message(STATUS "forcing COMPILER_RT_DEFAULT_TARGET_TRIPLE as `${CMAKE_C_COMPILER_TARGET}` (C compiler target) as a last resort")
+      set(COMPILER_RT_DEFAULT_TARGET_TRIPLE ${CMAKE_C_COMPILER_TARGET})
+    endif()
+  endif()
 
   if(CMAKE_C_COMPILER_ID MATCHES "Clang")
     set(option_prefix "")
