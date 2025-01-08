@@ -11,16 +11,13 @@
 
 #include "startup/riscovite/do_start.h"
 #include "config/riscovite/app.h"
-//#include "include/llvm-libc-macros/link-macros.h"
 #include "src/__support/OSUtil/syscall.h"
 #include "src/__support/macros/config.h"
-//#include "src/__support/threads/thread.h"
 #include "src/stdlib/atexit.h"
 #include "src/stdlib/exit.h"
 #include "src/unistd/environ.h"
 
 #include <stdint.h>
-//#include <sys/mman.h>
 
 extern "C" int main(int argc, char **argv, char **envp);
 
@@ -33,9 +30,10 @@ extern uintptr_t __init_array_start[];
 extern uintptr_t __init_array_end[];
 extern uintptr_t __fini_array_start[];
 extern uintptr_t __fini_array_end[];
+} // extern "C"
 
 namespace LIBC_NAMESPACE_DECL {
-//AppProperties app;
+AppProperties app;
 
 using InitCallback = void(int, char **, char **);
 using FiniCallback = void(void);
@@ -62,93 +60,70 @@ static TLSDescriptor tls;
 void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
 
 [[noreturn]] void do_start() {
-/*
-  auto tid = syscall_impl<long>(SYS_gettid);
-  if (tid <= 0)
-    syscall_impl<long>(SYS_exit, 1);
-  main_thread_attrib.tid = static_cast<int>(tid);
+  // Before _start calls this function it places a pointer to the incoming
+  // arguments in app.args. The rest of "app" (an AppProperties object defined
+  // above) is for us to populate here before we begin running the main program.
 
-  // After the argv array, is a 8-byte long NULL value before the array of env
-  // values. The end of the env values is marked by another 8-byte long NULL
-  // value. We step over it (the "+ 1" below) to get to the env values.
+  // When the RISCovite supervisor transfers control to a new program, the
+  // stack contains:
+  // - argc
+  // - argv pointers of length argc
+  // - a null pointer to mark the end of argv
+  // - environ pointers
+  // - a null pointer to mark the end of environ
+  // - auxillary vector entries
+  // - a null auxillary vector entry to mark the end of the auxillary vector
+  //
+  // We're not provided with a direct pointer to the start of either environ
+  // or auxval, so we need to calculate environ based on argc+argv, and then
+  // find auxval by walking forward until we find the end of environ.
   uintptr_t *env_ptr = app.args->argv + app.args->argc + 1;
   uintptr_t *env_end_marker = env_ptr;
   app.env_ptr = env_ptr;
-  while (*env_end_marker)
+  while (*env_end_marker) {
     ++env_end_marker;
+  }
 
-  // Initialize the POSIX global declared in unistd.h
+  // We also provide the environment vector in the global variable "environ"
+  // that POSIX requires in unistd.h. We don't aspire to be fully
+  // POSIX-compliant, but we do make some effort on the basics to make it
+  // easier to port software that targets the POSIX API without too many
+  // modifications.
   environ = reinterpret_cast<char **>(env_ptr);
 
-  // After the env array, is the aux-vector. The end of the aux-vector is
-  // denoted by an AT_NULL entry.
-  ElfW(Phdr) *program_hdr_table = nullptr;
-  uintptr_t program_hdr_count = 0;
+  // env_end_marker is now pointing at the NULL at the end of the environ
+  // vector, and so the auxillary vector begins directly afterward.
   app.auxv_ptr = reinterpret_cast<AuxEntry *>(env_end_marker + 1);
-  for (auto *aux_entry = app.auxv_ptr; aux_entry->id != AT_NULL; ++aux_entry) {
-    switch (aux_entry->id) {
-    case AT_PHDR:
-      program_hdr_table = reinterpret_cast<ElfW(Phdr) *>(aux_entry->value);
-      break;
-    case AT_PHNUM:
-      program_hdr_count = aux_entry->value;
-      break;
-    case AT_PAGESZ:
-      app.page_size = aux_entry->value;
-      break;
-    default:
-      break; // TODO: Read other useful entries from the aux vector.
-    }
-  }
 
-  ptrdiff_t base = 0;
+  // TODO: Actually walk over the aux vector so we can find the program
+  // headers, which we'll need to find the  PT_TLS segment that acts as the
+  // thread local storage initialization image. For now we just zero out all
+  // of those fields because we don't have threading support implemented yet
+  // anyway.
+  app.tls.address = 0;
   app.tls.size = 0;
-  ElfW(Phdr) *tls_phdr = nullptr;
+  app.tls.init_size = 0;
+  app.tls.align = 0;
 
-  for (uintptr_t i = 0; i < program_hdr_count; ++i) {
-    ElfW(Phdr) &phdr = program_hdr_table[i];
-    if (phdr.p_type == PT_PHDR)
-      base = reinterpret_cast<ptrdiff_t>(program_hdr_table) - phdr.p_vaddr;
-    if (phdr.p_type == PT_DYNAMIC && _DYNAMIC)
-      base = reinterpret_cast<ptrdiff_t>(_DYNAMIC) - phdr.p_vaddr;
-    if (phdr.p_type == PT_TLS)
-      tls_phdr = &phdr;
-    // TODO: adjust PT_GNU_STACK
-  }
+  // TODO: Once we actually have thread handling implemented, prepare the
+  // main thread by pushing its TLS area onto the stack.
 
-  app.tls.address = tls_phdr->p_vaddr + base;
-  app.tls.size = tls_phdr->p_memsz;
-  app.tls.init_size = tls_phdr->p_filesz;
-  app.tls.align = tls_phdr->p_align;
+  // TODO: Set up the atexit table for the main thread.
 
-  // This descriptor has to be static since its cleanup function cannot
-  // capture the context.
-  init_tls(tls);
-  if (tls.size != 0 && !set_thread_ptr(tls.tp))
-    syscall_impl<long>(SYS_exit, 1);
-
-  self.attrib = &main_thread_attrib;
-  main_thread_attrib.atexit_callback_mgr =
-      internal::get_thread_atexit_callback_mgr();
-
-  // We want the fini array callbacks to be run after other atexit
-  // callbacks are run. So, we register them before running the init
-  // array callbacks as they can potentially register their own atexit
-  // callbacks.
-  atexit(&call_fini_array_callbacks);
+  atexit(call_fini_array_callbacks);
 
   call_init_array_callbacks(static_cast<int>(app.args->argc),
                             reinterpret_cast<char **>(app.args->argv),
                             reinterpret_cast<char **>(env_ptr));
-*/
 
+  // We should now have the runtime environment configured enough to pass
+  // control to the main program.
   int retval = main(static_cast<int>(app.args->argc),
                     reinterpret_cast<char **>(app.args->argv),
                     //reinterpret_cast<char **>(env_ptr));
                     NULL);
 
-  exit(retval);
-}
+  exit(retval); // does not return
 }
 
 } // namespace LIBC_NAMESPACE_DECL
