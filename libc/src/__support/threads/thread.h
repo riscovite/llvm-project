@@ -22,8 +22,12 @@
 #include "src/__support/macros/config.h"
 #include "src/__support/macros/properties/architectures.h"
 
-// TODO: fix this unguarded linux dep
+#ifdef __linux__
 #include <linux/param.h> // for exec_pagesize.
+#else
+// TEMP HACK: a hard-coded value because otherwise this will only compile on Linux.
+#define EXEC_PAGESIZE 4096
+#endif
 
 #include <stddef.h> // For size_t
 #include <stdint.h>

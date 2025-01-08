@@ -39,6 +39,8 @@
 
 #if defined(__linux__)
 #include "src/__support/threads/linux/mutex.h"
+#elif defined(__RISCovite__)
+#include "src/__support/threads/riscovite/mutex.h"
 #elif defined(LIBC_TARGET_ARCH_IS_GPU)
 #include "src/__support/threads/gpu/mutex.h"
 #endif // __linux__
