@@ -230,14 +230,18 @@ option(COMPILER_RT_EXCLUDE_ATOMIC_BUILTIN
   "Skip the atomic builtin (these should normally be provided by a shared library)"
   On)
 
-if(NOT FUCHSIA AND NOT COMPILER_RT_BAREMETAL_BUILD AND NOT COMPILER_RT_GPU_BUILD)
-  set(GENERIC_SOURCES
-    ${GENERIC_SOURCES}
-    emutls.c
-    enable_execute_stack.c
-    eprintf.c
-  )
-endif()
+# TEMP HACK: The following additional functions are not needed on RISCovite and
+# make the RISCovite toolchain build fail.
+# TODO: Find a better way to disable this. Opting out each OS that doesn't need
+# these individually seems like an unfortunate design.
+#if(NOT FUCHSIA AND NOT COMPILER_RT_BAREMETAL_BUILD AND NOT COMPILER_RT_GPU_BUILD)
+#  set(GENERIC_SOURCES
+#    ${GENERIC_SOURCES}
+#    emutls.c
+#    enable_execute_stack.c
+#    eprintf.c
+#  )
+#endif()
 
 option(COMPILER_RT_LIBATOMIC_USE_PTHREAD
   "Whether libatomic should use pthreads if available."
