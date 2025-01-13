@@ -26,6 +26,11 @@ if(${LIBC_TARGET_OS} STREQUAL "linux")
   add_subdirectory(unistd)
 endif()
 
+if(${LIBC_TARGET_OS} STREQUAL "riscovite")
+  add_subdirectory(pthread)
+  add_subdirectory(unistd)
+endif()
+
 if(${LIBC_TARGET_OS} STREQUAL "gpu")
   add_subdirectory(gpu)
 endif()
