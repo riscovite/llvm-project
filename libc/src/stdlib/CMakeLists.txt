@@ -566,6 +566,7 @@ add_entrypoint_object(
     20 # For constinit 
   DEPENDS
     .exit_handler
+    libc.src.__support.CPP.new # to force including this since we can't automatically discover new objects through a header library
 )
 
 add_entrypoint_object(
