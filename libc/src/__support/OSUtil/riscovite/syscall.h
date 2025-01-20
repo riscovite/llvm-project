@@ -21,9 +21,9 @@
 namespace LIBC_NAMESPACE_DECL {
 
 template <typename R, typename... Ts>
-LIBC_INLINE R syscall_impl(long __number, Ts... ts) {
+LIBC_INLINE SyscallResult<R> syscall_impl(long __number, Ts... ts) {
   static_assert(sizeof...(Ts) <= 6, "Too many arguments for syscall");
-  return cpp::bit_or_static_cast<R>(syscall_impl(__number, (long)ts...));
+  return SyscallResult<R>(syscall_impl(__number, (long)ts...));
 }
 
 } // namespace LIBC_NAMESPACE_DECL
