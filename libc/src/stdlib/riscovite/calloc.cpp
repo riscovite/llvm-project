@@ -9,16 +9,14 @@
 #include "src/stdlib/calloc.h"
 #include "src/__support/freelist_heap.h"
 #include "src/__support/macros/config.h"
+#include "src/stdlib/riscovite/dlmalloc.h"
 
 #include <stddef.h>
 
 namespace LIBC_NAMESPACE_DECL {
 
 LLVM_LIBC_FUNCTION(void *, calloc, (size_t num, size_t size)) {
-  // TODO: Either select an existing allocator to use, or write one here.
-  auto _ = num; // unused for now
-  _ = size; // unused for now
-  return NULL;
+  return dlcalloc(num, size);
 }
 
 } // namespace LIBC_NAMESPACE_DECL

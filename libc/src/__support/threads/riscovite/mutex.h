@@ -19,7 +19,10 @@
 
 namespace LIBC_NAMESPACE_DECL {
 
-// FIXME: This is currently just a stub which needs implementing.
+// FIXME: This doesn't currently actually provide any mutual-exclusion because
+// we've not implemented threading and so in practice there can be only one
+// thread anyway. We'll need to implement this once the rest of the threading
+// system is implemented.
 class Mutex final {
 
 public:
@@ -32,23 +35,19 @@ public:
   }
 
   LIBC_INLINE static MutexError destroy(Mutex *lock) {
-    LIBC_ASSERT(false && "Mutex not yet implemented.");
     return MutexError::NONE;
   }
 
   LIBC_INLINE MutexError lock() {
-    LIBC_ASSERT(false && "Mutex not yet implemented.");
     return MutexError::NONE;
   }
 
   LIBC_INLINE MutexError unlock() {
-    LIBC_ASSERT(false && "Mutex not yet implemented.");
-    return MutexError::UNLOCK_WITHOUT_LOCK;
+    return MutexError::NONE;
   }
 
   LIBC_INLINE MutexError try_lock() {
-    LIBC_ASSERT(false && "Mutex not yet implemented.");
-    return MutexError::BUSY;
+    return MutexError::NONE;
   }
 };
 

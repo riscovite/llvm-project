@@ -9,13 +9,14 @@
 #include "src/stdlib/free.h"
 #include "src/__support/freelist_heap.h"
 #include "src/__support/macros/config.h"
+#include "src/stdlib/riscovite/dlmalloc.h"
 
 #include <stddef.h>
 
 namespace LIBC_NAMESPACE_DECL {
 
 LLVM_LIBC_FUNCTION(void, free, (void *ptr)) {
-    auto _ = ptr; // unused for now
+    return dlfree(ptr);
 }
 
 } // namespace LIBC_NAMESPACE_DECL
