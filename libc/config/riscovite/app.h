@@ -80,8 +80,9 @@ struct TLSDescriptor {
   // The size of the TLS area.
   uintptr_t size = 0;
 
-  // The address of the TLS area. This address can be passed to cleanup
-  // functions like munmap.
+  // The address of the TLS area. If zero, the TLS area uses automatic storage
+  // and so does not need to be freed. Otherwise, pass this address to free(...)
+  // once the thread exits.
   uintptr_t addr = 0;
 
   // The value the thread pointer register should be initialized to.
@@ -92,9 +93,11 @@ struct TLSDescriptor {
   constexpr TLSDescriptor() = default;
 };
 
+uintptr_t get_tls_alloc_size(const TLSImage *tls);
+
 // Create and initialize the TLS area for the current thread. Should not
 // be called before app.tls has been initialized.
-void init_tls(TLSDescriptor &tls);
+void init_tls(void *alloc, TLSDescriptor &tls);
 
 // Cleanup the TLS area as described in |tls_descriptor|.
 void cleanup_tls(uintptr_t tls_addr, uintptr_t tls_size);

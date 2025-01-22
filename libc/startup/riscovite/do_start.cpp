@@ -9,10 +9,13 @@
 // FIXME: Everything in here is currently just a hacky copy of the Linux startup
 // code, and needs to be rewritten to make sense for RISCovite.
 
+#include "startup/riscovite/auxvec.h"
 #include "startup/riscovite/do_start.h"
 #include "config/riscovite/app.h"
 #include "src/__support/OSUtil/syscall.h"
 #include "src/__support/macros/config.h"
+#include "src/__support/OSUtil/riscovite/io.h"
+#include "src/__support/threads/thread.h"
 #include "src/stdlib/atexit.h"
 #include "src/stdlib/exit.h"
 #include "src/unistd/environ.h"
@@ -38,6 +41,19 @@ AppProperties app;
 using InitCallback = void(int, char **, char **);
 using FiniCallback = void(void);
 
+typedef struct {
+    uint32_t p_type;
+    uint32_t p_flags;
+    uint64_t p_offset;
+    uint64_t p_vaddr;
+    uint64_t p_paddr;
+    uint64_t p_filesz;
+    uint64_t p_memsz;
+    uint64_t p_align;
+} Elf64_Phdr;
+#define PT_PHDR 6
+#define PT_TLS 7
+
 static void call_init_array_callbacks(int argc, char **argv, char **env) {
   size_t preinit_array_size = __preinit_array_end - __preinit_array_start;
   for (size_t i = 0; i < preinit_array_size; ++i)
@@ -53,7 +69,7 @@ static void call_fini_array_callbacks() {
     reinterpret_cast<FiniCallback *>(__fini_array_start[i - 1])();
 }
 
-//static ThreadAttributes main_thread_attrib;
+static ThreadAttributes main_thread_attrib;
 static TLSDescriptor tls;
 // We separate teardown_main_tls from callbacks as callback function themselves
 // may require TLS.
@@ -63,6 +79,9 @@ void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
   // Before _start calls this function it places a pointer to the incoming
   // arguments in app.args. The rest of "app" (an AppProperties object defined
   // above) is for us to populate here before we begin running the main program.
+
+  // RISCovite just always uses 4k pages.
+  app.page_size = 4096;
 
   // When the RISCovite supervisor transfers control to a new program, the
   // stack contains:
@@ -93,22 +112,63 @@ void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
 
   // env_end_marker is now pointing at the NULL at the end of the environ
   // vector, and so the auxillary vector begins directly afterward.
+  Elf64_Phdr *program_hdr_table = nullptr;
+  uintptr_t program_hdr_count = 0;
   app.auxv_ptr = reinterpret_cast<AuxEntry *>(env_end_marker + 1);
+  for (auto *aux_entry = app.auxv_ptr; aux_entry->id != AT_NULL; ++aux_entry) {
+    switch (aux_entry->id) {
+    case AT_PHDR:
+      program_hdr_table = reinterpret_cast<Elf64_Phdr *>(aux_entry->value);
+      break;
+    case AT_PHNUM:
+      program_hdr_count = aux_entry->value;
+      break;
+    default:
+      break; // TODO: Read other useful entries from the aux vector.
+    }
+  }
 
-  // TODO: Actually walk over the aux vector so we can find the program
-  // headers, which we'll need to find the  PT_TLS segment that acts as the
-  // thread local storage initialization image. For now we just zero out all
-  // of those fields because we don't have threading support implemented yet
-  // anyway.
-  app.tls.address = 0;
+  ptrdiff_t base = 0;
   app.tls.size = 0;
-  app.tls.init_size = 0;
-  app.tls.align = 0;
+  Elf64_Phdr *tls_phdr = nullptr;
 
-  // TODO: Once we actually have thread handling implemented, prepare the
-  // main thread by pushing its TLS area onto the stack.
+  for (uintptr_t i = 0; i < program_hdr_count; ++i) {
+    Elf64_Phdr &phdr = program_hdr_table[i];
+    if (phdr.p_type == PT_PHDR)
+      base = reinterpret_cast<ptrdiff_t>(program_hdr_table) - phdr.p_vaddr;
+    if (phdr.p_type == PT_TLS)
+      tls_phdr = &phdr;
+  }
+  if (tls_phdr != nullptr) {
+    app.tls.address = tls_phdr->p_vaddr + base;
+    app.tls.size = tls_phdr->p_memsz;
+    app.tls.init_size = tls_phdr->p_filesz;
+    app.tls.align = tls_phdr->p_align;
+  } else {
+    app.tls.address = 0;
+    app.tls.size = 0;
+    app.tls.init_size = 0;
+    app.tls.align = 1;
+  }
 
-  // TODO: Set up the atexit table for the main thread.
+  auto tls_alloc_size = get_tls_alloc_size(&app.tls);
+  if (tls_alloc_size != 0) {
+    // If the program eventually creates other threads then we'll use
+    // dynamic memory allocation for their stacks and TLS areas, but
+    // for the main thread we'll just place the TLS area on the main
+    // stack since that avoids imposing a mandatory dynamic memory
+    // allocation on a single-thread-only program.
+    void *tls_area = __builtin_alloca(tls_alloc_size);
+    init_tls(tls_area, tls);
+    tls.addr = 0; // we used automatic storage for this, so we mustn't free() it later
+  }
+  if (tls.size != 0 && !set_thread_ptr(tls.tp)) {
+    syscall_impl<long>(0x800 /* EXIT */, 1);
+  }
+
+  self.attrib = &main_thread_attrib;
+  // TODO: Enable this once we have a thread.cpp support implementation for RISCovite
+  //main_thread_attrib.atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
 
   atexit(call_fini_array_callbacks);
 
