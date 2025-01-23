@@ -16,6 +16,8 @@
 
 #ifdef LIBC_TARGET_ARCH_IS_ANY_RISCV
 #include "riscv/syscall.h"
+#else
+#error "RISCovite OS target is only supported for RISC-V architecture"
 #endif
 
 namespace LIBC_NAMESPACE_DECL {

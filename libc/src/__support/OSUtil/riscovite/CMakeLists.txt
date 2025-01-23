@@ -10,6 +10,7 @@ add_object_library(
     exit.cpp
   HDRS
     syscall.h
+    sysfuncs.h
     io.h
   DEPENDS
     .${LIBC_TARGET_ARCHITECTURE}.riscovite_${LIBC_TARGET_ARCHITECTURE}_util
