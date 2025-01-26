@@ -6,9 +6,6 @@
 //
 //===----------------------------------------------------------------------===//
 
-// FIXME: Everything in here is currently just a hacky copy of the Linux startup
-// code, and needs to be rewritten to make sense for RISCovite.
-
 #include "startup/riscovite/auxvec.h"
 #include "startup/riscovite/do_start.h"
 #include "config/riscovite/app.h"
@@ -180,8 +177,7 @@ void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
   // control to the main program.
   int retval = main(static_cast<int>(app.args->argc),
                     reinterpret_cast<char **>(app.args->argv),
-                    //reinterpret_cast<char **>(env_ptr));
-                    NULL);
+                    reinterpret_cast<char **>(env_ptr));
 
   exit(retval); // does not return
 }
