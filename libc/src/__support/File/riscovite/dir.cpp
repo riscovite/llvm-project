@@ -15,50 +15,31 @@
 
 #include "hdr/fcntl_macros.h" // For open flags
 
+#include <errno.h>
+
 namespace LIBC_NAMESPACE_DECL {
 
-ErrorOr<int> platform_opendir(const char *name) {
-  return ErrorOr<int>(cpp::unexpected(EOPNOTSUPP));
-/*
-  int open_flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
-#ifdef SYS_open
-  int fd = LIBC_NAMESPACE::syscall_impl<int>(SYS_open, name, open_flags);
-#elif defined(SYS_openat)
-  int fd =
-      LIBC_NAMESPACE::syscall_impl<int>(SYS_openat, AT_FDCWD, name, open_flags);
-#else
-#error                                                                         \
-    "SYS_open and SYS_openat syscalls not available to perform an open operation."
-#endif
-
-  if (fd < 0) {
-    return LIBC_NAMESPACE::Error(-fd);
+ErrorOr<int> platform_opendir(const char *path) {
+  uint64_t open_flags = RISCOVITE_OPEN_DIR;
+  SyscallResult<uint64_t> result = LIBC_NAMESPACE::syscall_impl<uint64_t>(RISCOVITE_SYS_OPEN, RISCOVITE_HND_CWD, path, open_flags);
+  if (result.error != 0) {
+    return Error(static_cast<int>(result.error));
   }
-  return fd;
-*/
+  return static_cast<int>(result.value);
 }
 
 ErrorOr<size_t> platform_fetch_dirents(int fd, cpp::span<uint8_t> buffer) {
-  return ErrorOr<size_t>(cpp::unexpected(EOPNOTSUPP));
-/*
-#ifdef SYS_getdents64
-  long size = LIBC_NAMESPACE::syscall_impl<long>(SYS_getdents64, fd,
-                                                 buffer.data(), buffer.size());
-#else
-#error "getdents64 syscalls not available to perform a fetch dirents operation."
-#endif
-
-  if (size < 0) {
-    return LIBC_NAMESPACE::Error(static_cast<int>(-size));
+  auto result = LIBC_NAMESPACE::syscall_impl<size_t>(RISCOVITE_SYS_READ_DIR, (uint64_t)fd, buffer.data(), buffer.size(), ~(uint64_t)0);
+  if (result.error != 0) {
+    return LIBC_NAMESPACE::Error(static_cast<int>(result.error));
   }
-  return size;
-*/
+  return result.value;
 }
 
 int platform_closedir(int hnd_num) {
-  int ret = LIBC_NAMESPACE::syscall_impl<int>(RISCOVITE_SYS_CLOSE, hnd_num);
-  if (ret < 0) {
-    return static_cast<int>(-ret);
+  auto result = LIBC_NAMESPACE::syscall_impl<int>(RISCOVITE_SYS_CLOSE, hnd_num);
+  if (result.error != 0) {
+    return static_cast<int>(result.error);
   }
   return 0;
 }

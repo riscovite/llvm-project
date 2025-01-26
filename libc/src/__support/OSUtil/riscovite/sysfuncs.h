@@ -9,6 +9,13 @@
 #ifndef LLVM_LIBC_SRC___SUPPORT_OSUTIL_RISCOVITE_SYSFUNCS_H
 #define LLVM_LIBC_SRC___SUPPORT_OSUTIL_RISCOVITE_SYSFUNCS_H
 
+// NOTE: This file intentionally includes only comments and preprocessor
+// directives that expand to plain constant numbers so that it can potentially
+// be used by both C/C++ and assembly language callers.
+//
+// sysfunc_types.h is a supporting header that defines C-friendly types for
+// use by library code that is interacting with the system functions.
+
 //// core functions
 #define RISCOVITE_SYS_SET_HEAP_SIZE (0x010)
 #define RISCOVITE_SYS_CLOSE (0x020)

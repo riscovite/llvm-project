@@ -52,7 +52,7 @@ add_object_library(
 )
 
 add_object_library(
-  dir
+  riscovite_dir
   SRCS
     dir.cpp
   DEPENDS

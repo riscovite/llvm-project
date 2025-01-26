@@ -45,6 +45,30 @@ class Dir {
   // size, we store the data in a byte array.
   uint8_t buffer[BUFSIZE];
 
+#ifdef __RISCovite__
+  // RISCovite's read_dir system function produces directory entries that
+  // don't include anything like an "inode" on POSIX systems, so readdir
+  // copies one entry from the buffer into a synthetic "struct dirent" retained
+  // here as part of the Dir object. This means that each call to readdir
+  // invalidates the result of any previous call, but that compromise is
+  // explicitly permitted by POSIX.1-2024.
+  //
+  // Unfortunately we can't directly use struct dirent here because its
+  // d_name field is not sized, so instead we have at leastenough bytes for a
+  // dirent with 254 bytes of d_name, which is the maximum name string
+  // length on RISCovite (253 bytes plus the null pointer). We might actually
+  // end up with extras depending on how dirent.d_name is defined, but we'll
+  // accept that for now until upstream LLVM libc decides how it wants to
+  // handle platforms whose buffer cannot directly contain dirent objects.
+  alignas(struct ::dirent) uint8_t prev_entry[sizeof(struct ::dirent) + 254];
+
+  // RISCovite's read_dir also doesn't include "." and ".." entries, since
+  // those are not actually treated as directory entries in RISCovite's
+  // model -- they are just part of the DOS VFS path syntax. But POSIX-targeting
+  // applications will expect them to appear, so we'll fake them.
+  uint8_t fake_dotdot;
+#endif
+
   Mutex mutex;
 
   // A directory is to be opened by the static method open and closed
@@ -55,6 +79,9 @@ class Dir {
 
   LIBC_INLINE explicit Dir(int fdesc)
       : fd(fdesc), readptr(0), fillsize(0),
+#ifdef __RISCovite__
+        fake_dotdot(2),
+#endif
         mutex(/*timed=*/false, /*recursive=*/false, /*robust=*/false,
               /*pshared=*/false) {}
   LIBC_INLINE ~Dir() = default;

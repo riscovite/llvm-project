@@ -61,7 +61,7 @@ ErrorOr<File *> openfile(const char *path, const char *mode) {
     // return {nullptr, EINVAL};
     return Error(EINVAL);
   }
-  uint64_t open_flags = 0;
+  uint64_t open_flags = RISCOVITE_OPEN_FILE;
   if (modeflags & ModeFlags(File::OpenMode::APPEND)) {
     open_flags = RISCOVITE_OPEN_CREATE | RISCOVITE_OPEN_APPEND;
     if (modeflags & ModeFlags(File::OpenMode::PLUS))

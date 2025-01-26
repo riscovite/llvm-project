@@ -27,6 +27,7 @@ if(${LIBC_TARGET_OS} STREQUAL "linux")
 endif()
 
 if(${LIBC_TARGET_OS} STREQUAL "riscovite")
+  add_subdirectory(dirent)
   add_subdirectory(pthread)
   add_subdirectory(unistd)
 endif()

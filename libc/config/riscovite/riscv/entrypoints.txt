@@ -23,6 +23,12 @@ set(TARGET_LIBC_ENTRYPOINTS
     # compiler entrypoints (no corresponding header)
     #libc.src.compiler.__stack_chk_fail
 
+    # dirent.h entrypoints
+    libc.src.dirent.closedir
+    libc.src.dirent.dirfd
+    libc.src.dirent.opendir
+    libc.src.dirent.readdir
+
     # errno.h entrypoints
     libc.src.errno.errno
 
