@@ -13,6 +13,8 @@
 
 #ifdef __linux__
 typedef __futex_word pthread_once_t;
+#elif defined(__RISCovite__)
+typedef unsigned long pthread_once_t;
 #else
 #error "Once flag type not defined for the target platform."
 #endif

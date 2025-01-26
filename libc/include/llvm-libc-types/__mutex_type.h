@@ -21,6 +21,8 @@ typedef struct {
 
 #ifdef __linux__
   __futex_word __ftxw;
+#elif defined(__RISCovite__)
+  // FIXME: decide what fields/types we're going to use for tracking the mutex
 #else
 #error "Mutex type not defined for the target platform."
 #endif

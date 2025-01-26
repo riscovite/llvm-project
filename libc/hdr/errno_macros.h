@@ -15,6 +15,8 @@
 #include <linux/errno.h>
 
 #include "include/llvm-libc-macros/error-number-macros.h"
+#elif defined(__RISCovite__)
+#include "include/llvm-libc-macros/error-number-macros.h"
 #else // __linux__
 #include "include/llvm-libc-macros/generic-error-number-macros.h"
 #endif

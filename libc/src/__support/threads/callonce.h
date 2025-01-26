@@ -18,6 +18,8 @@
 // - callonce_impl::callonce_slowpath for slow path execution
 #ifdef __linux__
 #include "src/__support/threads/linux/callonce.h"
+#elif defined(__RISCovite__)
+#include "src/__support/threads/riscovite/callonce.h"
 #else
 #error "callonce is not supported on this platform"
 #endif

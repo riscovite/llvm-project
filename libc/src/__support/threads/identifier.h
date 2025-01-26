@@ -16,7 +16,9 @@
 #include "hdr/types/pid_t.h"
 #include "src/__support/OSUtil/syscall.h"
 #include "src/__support/macros/optimization.h"
+#ifdef __linux__
 #include <sys/syscall.h>
+#endif
 
 namespace LIBC_NAMESPACE_DECL {
 namespace internal {
@@ -33,8 +35,15 @@ LIBC_INLINE pid_t *get_tid_cache() {
 
 LIBC_INLINE pid_t gettid() {
   pid_t *cache = get_tid_cache();
-  if (LIBC_UNLIKELY(!cache || *cache <= 0))
+  if (LIBC_UNLIKELY(!cache || *cache <= 0)) {
+#if defined(__linux__)
     return syscall_impl<pid_t>(SYS_gettid);
+#elif defined(__RISCovite__)
+    return 0; // FIXME: Should probably maintain _some_ sort of thread ids on RISCovite
+#else
+  #error getttid is not implemented for this target
+#endif
+  }
   return *cache;
 }
 
