@@ -202,23 +202,39 @@ thread_switching_interrupt_handler(uint64_t a0) {
       "s5", "s6", "s7", "s8", "s9", "s10", "s11");
 }
 
+/*
+__attribute__((always_inline)) static void set_interrupt_enable(bool enabled) {
+  asm volatile("csrw 0x800, %[ENABLED]" : : [ENABLED] "r"(enabled));
+}
+*/
+
+__attribute__((always_inline)) static bool disable_interrupts() {
+  uint64_t ret;
+  asm volatile("csrrwi %[RET], 0x800, 0" : [RET] "=r"(ret));
+  return ret;
+}
+
+__attribute__((always_inline)) static bool enable_interrupts() {
+  uint64_t ret;
+  asm volatile("csrrwi %[RET], 0x800, 1" : [RET] "=r"(ret));
+  return ret;
+}
+
 // The implementation of the "idle thread" that becomes current whenever
 // there are no normal runnable threads.
 __attribute__((noreturn)) void idle_thread() {
-  // TODO: Implement
-  // Pseudocode something like:
-  // infinite loop {
-  //    mask all interrupts
-  //    if there is at least one runnable thread {
-  //      set the force-thread-switch software interrupt pending
-  //      unmask interrupts (probably causing this thread to suspend)
-  //      return to start of loop (once there are no runnable threads again)
-  //    }
-  //    wfi
-  //    unmask interrupts (potentially allowing interrupt handlers to make other
-  //    threads runnable)
-  // }
+  auto s = app.multithreading_state();
   for (;;) {
+    disable_interrupts();
+    if (s->runnable_threads.head != nullptr) {
+      // TODO: Set the force-thread-switch interrupt pending
+      enable_interrupts(); // probably causes this thread to be suspended
+      continue;
+    }
+    asm volatile("wfi");
+    enable_interrupts();
+    // Interrupt handlers might now make other threads runnable before we
+    // check again on the next iteration.
   }
 }
 
@@ -267,7 +283,7 @@ static ThreadState *switch_threads(ThreadState *current_state) {
 // The ThreadStateInterruptHandler called by the software interrupt we
 // use to force thread switching.
 static ThreadState *force_thread_switch_handler(uint64_t a0,
-                                         ThreadState *current_state) {
+                                                ThreadState *current_state) {
   (void)a0;
   // By the time we get here the code that activated this thread switch should
   // have already put the current thread into at least one of the following
