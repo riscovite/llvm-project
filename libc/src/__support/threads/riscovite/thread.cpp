@@ -20,6 +20,7 @@
 #include "src/errno/libc_errno.h" // For error macros
 
 #include <stdint.h>
+#include <stdio.h>
 
 namespace LIBC_NAMESPACE_DECL {
 
@@ -49,18 +50,26 @@ static constexpr ErrorOr<size_t> round_for_stack(size_t v) {
 
 void thread_startup_posix(void *arg, ThreadRunnerPosix runner,
                           ThreadTracker *tracker) {
-  (void)arg;
-  (void)runner;
   (void)tracker;
-  // TODO: Implement
+  void *result = runner(arg);
+  // TODO: Either shut down the thread or mark it as complete so
+  // another thread can "join" it, depending on its settings.
+  printf("POSIX-style thread exited with %p\n", result);
+  for (;;) {
+    asm volatile("wfi");
+  }
 }
 
 void thread_startup_stdc(void *arg, ThreadRunnerStdc runner,
                          ThreadTracker *tracker) {
-  (void)arg;
-  (void)runner;
   (void)tracker;
-  // TODO: Implement
+  int result = runner(arg);
+  // TODO: Either shut down the thread or mark it as complete so
+  // another thread can "join" it, depending on its settings.
+  printf("StdC-style thread exited with %d\n", result);
+  for (;;) {
+    asm volatile("wfi");
+  }
 }
 
 // A pointer to a function implementing an interrupt handler for switching
@@ -220,63 +229,115 @@ __attribute__((always_inline)) static bool enable_interrupts() {
   return ret;
 }
 
+__attribute__((always_inline)) static void set_interrupt_enable(bool enabled) {
+  asm volatile("csrw 0x800, %[V]" : : [V] "r"(enabled));
+}
+
+static LIBC_INLINE void yield_timeslice(AppThreading *s) {
+  constexpr uint64_t SYS_SET_INTERRUPT_PENDING =
+      syscall_iface_func_num(0, 0x001);
+  uint64_t suspend_intr_hnd_num = s->thread_switch_hnd_num;
+  syscall_impl<uint64_t>(SYS_SET_INTERRUPT_PENDING, suspend_intr_hnd_num, 1);
+}
+
 // The implementation of the "idle thread" that becomes current whenever
 // there are no normal runnable threads.
 __attribute__((noreturn)) void idle_thread() {
   auto s = app.multithreading_state();
   for (;;) {
     disable_interrupts();
-    if (s->runnable_threads.head != nullptr) {
-      // TODO: Set the force-thread-switch interrupt pending
-      enable_interrupts(); // probably causes this thread to be suspended
+    if (!s->runnable_threads.is_empty()) {
+      // We'll set the "force-suspend" interrupt pending, so that once we
+      // re-enable interrupts this idle thread should be suspended in favor
+      // of whichever thread is at the head of the runnable list.
+      yield_timeslice(s);
+      enable_interrupts();
+      // We should typically not resume executing here again until next time
+      // there are no runnable threads.
       continue;
     }
+    // Sleep until BIOS thinks we might need to service an interrupt.
+    // We do this with interrupts disabled intentionally so that we can make
+    // sure that the runnable threads list can't become non-empty again before
+    // we get a chance to sleep.
     asm volatile("wfi");
     enable_interrupts();
     // Interrupt handlers might now make other threads runnable before we
-    // check again on the next iteration.
+    // check again on the next iteration. We might even yield to another
+    // thread here if one had been in the time-wait list and has now reached
+    // its re-awake time.
   }
 }
 
-static ThreadState *switch_threads(ThreadState *current_state) {
+// Forward-declaration because switch_threads and preempt_thread_switch_handler
+// are mutually-dependent.
+static ThreadState *preempt_thread_switch_handler(uint64_t a0,
+                                                  ThreadState *current_state);
+
+static ThreadState *switch_threads(ThreadState *current_state,
+                                   uint64_t current_time) {
   // We assume that global_state will always be non-nil because this function
   // should only be called by a thread-switching interrupt handler and those
   // should be activated only after we've switched to multithreaded mode.
   auto global_state = app.multithreading_state();
   global_state->running_thread->state = current_state;
 
-  // Before we try to pull from the runnable list, we'll check whether
-  // any of our time-waiters have reached their desired time.
-  auto now_result = syscall_impl<uint64_t>(RISCOVITE_SYS_GET_CURRENT_TIMESTAMP);
-  // Getting the current timestamp should never fail, but if it does
-  // then we'll just let the time-waiters stall in the time-wait list.
-  if (now_result.error == 0) {
-    uint64_t now = now_result.value;
-    ThreadTracker *current = global_state->time_waiting_threads.head;
-    while (current != NULL) {
-      if (current->wake_time > now) {
-        break; // The time-wait list is ordered by wake time, so the rest must
-               // be in the future
-      }
-      // TODO: Move this task to the end of the runnable thread list, since
-      // its wait time has elapsed. This will also remove it from the waiter
-      // list for any synchronization primitive it's currently waiting on,
-      // since it has reached its waiting deadline.
-      // TODO: Also set the thread's a0 register to a value representing
-      // "timeout" so that when it resumes the lowest-level yield function
-      // can distinguish that from successfully acquiring whatever the
-      // thread was waiting for, if anything.
-      current = current->next_timed;
+  ThreadTracker *current = global_state->time_waiting_threads.first();
+  while (current != nullptr) {
+    if (current->wake_time > current_time) {
+      break; // The time-wait list is ordered by wake time, so the rest must
+             // be in the future
     }
+    global_state->remove_time_waiter(current);
+    // The following both marks the thread as runnable and removes it from
+    // any other wait list it might have been participating in, since
+    // we use the same intrusive linked list fields for both wait lists
+    // and the runnable list.
+    global_state->push_runnable_tail(current);
+    // TODO: Also set the thread's a0 register to a value representing
+    // "timeout" so that when it resumes the lowest-level yield function
+    // can distinguish that from successfully acquiring whatever the
+    // thread was waiting for, if anything.
+    current = global_state->time_waiting_threads.next(current);
   }
 
-  ThreadTracker *next = global_state->runnable_threads.head;
+  ThreadTracker *next = global_state->next_runnable();
+  ThreadTracker *successor_runnable = nullptr;
   if (next != nullptr) {
+    successor_runnable = global_state->runnable_threads.next(next);
     global_state->running_thread = next;
+    global_state->runnable_threads.push_tail(next);
   } else {
     // Nothing is runnable, so we'll switch to the idle task.
     global_state->running_thread = &global_state->idle;
   }
+
+  // If there's either another runnable thread or a time-waiting thread
+  // then we'll ask the supervisor to preempt the new thread at the
+  // appropriate future time.
+  auto successor_timed_wait = global_state->next_time_waiter();
+  if (successor_runnable != nullptr || successor_timed_wait != nullptr) {
+    // 4ms is the default timeslice. TODO: Make this customizable?
+    uint64_t preempt_time = current_time + 4000000;
+    if (successor_runnable == nullptr &&
+        successor_timed_wait->wake_time > preempt_time) {
+      // If there is no immediately-runnable task and the next time-waiter
+      // is further than one standard timeslice in the future then we'll
+      // extend the timeslice until the time-waiter's wait time.
+      // TODO: Should we let a very-near-future waiter slightly truncate
+      // the timeslice to let it wake up closer to the time it requested?
+      preempt_time = successor_runnable->wake_time;
+    }
+
+    auto result =
+        syscall_impl<uint64_t>(RISCOVITE_SYS_SET_TIMER_INTERRUPT, preempt_time,
+                               (uint64_t)&thread_switching_interrupt_handler<
+                                   preempt_thread_switch_handler>,
+                               (uint64_t)PREEMPT_INTERRUPT_PRIORITY);
+    (void)result; // Can't really do anything if the timer setup fails, but it
+                  // ought not to
+  }
+
   return global_state->running_thread->state;
 }
 
@@ -285,6 +346,23 @@ static ThreadState *switch_threads(ThreadState *current_state) {
 static ThreadState *force_thread_switch_handler(uint64_t a0,
                                                 ThreadState *current_state) {
   (void)a0;
+
+  auto now_result = syscall_impl<uint64_t>(RISCOVITE_SYS_GET_CURRENT_TIMESTAMP);
+  uint64_t current_time = now_result.value;
+  if (now_result.error != 0) {
+    // It would be very weird for us to fail to get the current timestamp,
+    // but if this does happen somehow then we'll pretend we're right at the
+    // system's epoch, which effectively means that time-waiting threads cannot
+    // reach their wake time on this call.
+    current_time = 0;
+  }
+
+  auto s = app.multithreading_state();
+  constexpr uint64_t SYS_CLEAR_INTERRUPT_PENDING =
+      syscall_iface_func_num(0, 0x002);
+  uint64_t suspend_intr_hnd_num = s->thread_switch_hnd_num;
+  syscall_impl<uint64_t>(SYS_CLEAR_INTERRUPT_PENDING, suspend_intr_hnd_num);
+
   // By the time we get here the code that activated this thread switch should
   // have already put the current thread into at least one of the following
   // so that it can potentially run again in future:
@@ -294,7 +372,38 @@ static ThreadState *force_thread_switch_handler(uint64_t a0,
   //
   // Therefore we have nothing special to do here and can just run our usual
   // bookkeeping and new thread selection code.
-  return switch_threads(current_state);
+  return switch_threads(current_state, current_time);
+}
+
+// The ThreadStateInterruptHandler called by the task's timer to preempt a
+// thread that has been running longer than its timeslice.
+static ThreadState *preempt_thread_switch_handler(uint64_t a0,
+                                                  ThreadState *current_state) {
+  (void)a0;
+  auto now_result = syscall_impl<uint64_t>(RISCOVITE_SYS_GET_CURRENT_TIMESTAMP);
+  uint64_t current_time = now_result.value;
+  if (now_result.error != 0) {
+    // It would be very weird for us to fail to get the current timestamp,
+    // but if this does happen somehow then we'll pretend we're right at the
+    // system's epoch, which effectively means that time-waiting threads cannot
+    // reach their wake time on this call.
+    current_time = 0;
+  }
+
+  // TODO: Perhaps we should decline to switch threads if the current task
+  // hasn't used up its timeslice yet. However, right now we always set the
+  // timer to an appropriate time for switching threads anyway, so that doesn't
+  // seem necessary.
+  return switch_threads(current_state, current_time);
+}
+
+// Reads the current value of the "gp" register, which we need to copy into
+// each new thread we create since it's supposed to be constant for the
+// whole runtime of the program.
+__attribute__((always_inline)) static uint64_t get_gp_register() {
+  uint64_t ret;
+  asm("mv %[RET], gp" : [RET] "=r"(ret) : : "gp");
+  return ret;
 }
 
 int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
@@ -304,58 +413,74 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   if (activate_err != 0)
     return activate_err;
 
-  (void)style;
-  (void)runner;
-  (void)arg;
-  (void)stack;
-  (void)stacksize;
-  (void)guardsize;
-  (void)detached;
-
-  // In addition to the stack space requested by the application, we also
-  // include some extra space for the ThreadTracker object for the thread and
-  // for the ThreadState object that we'll leave at the top of its stack
-  // whenever the thread is suspended.
+  bool owned_stack = (stack == nullptr);
   auto round_or_err = round_for_stack(get_tls_alloc_size(&app.tls));
   if (!round_or_err)
     return round_or_err.error();
   size_t tls_alloc_size = round_or_err.value();
-  size_t overhead_size = THREAD_TRACKING_OVERHEAD + tls_alloc_size;
-
-  round_or_err = round_to_page(stacksize + overhead_size);
-  if (!round_or_err)
-    return round_or_err.error();
-  stacksize = round_or_err.value();
-  round_or_err = round_to_page(guardsize);
-  if (!round_or_err)
-    return round_or_err.error();
-  guardsize = round_or_err.value();
-
-  size_t guard_pages = guardsize >> 12;
-  if (guard_pages > 65535) {
-    return EINVAL; // create_memory_block requires this packed into 16 bytes
+  size_t overhead_size =
+      THREAD_TRACKING_OVERHEAD + tls_alloc_size + sizeof(ThreadAttributes);
+  size_t memblock_size = overhead_size;
+  size_t memblock_guard_pages = 0;
+  if (owned_stack) {
+    memblock_size += stacksize;
+    round_or_err = round_to_page(guardsize);
+    if (!round_or_err)
+      return round_or_err.error();
+    guardsize = round_or_err.value();
+    memblock_guard_pages = guardsize >> 12;
+    if (memblock_guard_pages > 65535) {
+      return EINVAL; // create_memory_block requires this packed into 16 bytes
+    }
+    guardsize = memblock_guard_pages << 12;
   }
+  round_or_err = round_to_page(memblock_size);
+  if (!round_or_err)
+    return round_or_err.error();
+  memblock_size = round_or_err.value();
 
   // We'll request a memory block that is readable and writable but not
   // executable, and that has the requested number of guard pages.
-  uint64_t memblock_flags = 0b011 | ((uint64_t)((uint16_t)guard_pages) << 32);
-
+  uint64_t memblock_flags =
+      0b011 | ((uint64_t)((uint16_t)memblock_guard_pages) << 32);
   auto result = syscall_impl<uint64_t>(RISCOVITE_SYS_CREATE_MEMORY_BLOCK,
-                                       (uint64_t)stacksize, memblock_flags);
+                                       (uint64_t)memblock_size, memblock_flags);
   if (result.error != 0) {
     return (int)result.error;
   }
   uint64_t memblock_hnd_num = (uint64_t)result.value;
-  // void *memblock_start = (void *)result.value;
-  void *memblock_end = (void *)(result.value + stacksize);
+  void *memblock_start = (void *)result.value;
+  void *memblock_end = (void *)(result.value + memblock_size);
 
-  // At the _end_ of our memory block we'll place the ThreadTracker object
-  // for this thread, with the TLS area just below it, and then the rest of
-  // the block will be the downward-growing stack, which will include the
-  // ThreadState object when the thread is suspended later.
+  // Our allocated memory block starts with our owned stack space (if any),
+  // followed by the TLS data, then ThreadAttributes, and then finally our
+  // ThreadTracker object.
   ThreadTracker *tracker = ((ThreadTracker *)memblock_end) - 1;
+  ThreadAttributes *attrs = ((ThreadAttributes *)tracker) - 1;
+  void *tls_base = ((char *)attrs) - tls_alloc_size;
+  size_t effective_stack_size =
+      owned_stack ? (char *)tls_base - (char *)memblock_start : stacksize;
+  if (owned_stack) {
+    stack = memblock_start;
+  }
+  effective_stack_size &= ~0xf; // round down to nearest 16 bytes for ABI-required stack alignment
+  void *stack_end = (char *)stack + effective_stack_size;
   tracker->memblock_hnd_num = memblock_hnd_num;
-  void *tls_base = ((char *)tracker) - tls_alloc_size;
+
+  this->attrib = attrs;
+  attrs->detach_state =
+      uint32_t(detached ? DetachState::DETACHED : DetachState::JOINABLE);
+  attrs->stack = stack;
+  attrs->stacksize = effective_stack_size;
+  attrs->guardsize = guardsize;
+  attrs->tls = (uintptr_t)tls_base;
+  attrs->tls_size = tls_alloc_size;
+  attrs->owned_stack = owned_stack ? 1 : 0;
+  attrs->style = style;
+  attrs->platform_data = tracker;
+
+  // We need to initialize the TLS area, including copying the executable's
+  // TLS image into it.
   TLSDescriptor tls_desc;
   init_tls(tls_base, tls_desc);
 
@@ -367,7 +492,12 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   // thread_startup_stdc, passing the arg and the given "runner". Those
   // noreturn functions both arrange for the thread to be cleaned up properly
   // once the runner returns.
-  auto state = (ThreadState *)(((char *)tls_base) - sizeof(ThreadState));
+  auto state = (ThreadState *)((uintptr_t)stack_end - sizeof(ThreadState));
+  tracker->state = state;
+  state->gp = get_gp_register();
+  state->tp = tls_desc.tp;
+  state->sp = (uint64_t)stack_end;
+  state->s[0] = state->sp; // optional frame pointer, in case something needs it
   state->a[0] = (uint64_t)arg;
   state->a[2] = (uint64_t)tracker;
   switch (style) {
@@ -381,7 +511,13 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
     break;
   }
 
-  return ENOTSUP;
+  // Now we'll set the new thread as runnable and yield this thread's own
+  // timeslice so that it can begin running.
+  auto threading_state = app.multithreading_state();
+  threading_state->push_runnable_head(tracker);
+  yield_timeslice(threading_state);
+
+  return 0;
 }
 
 int Thread::join(ThreadReturnValue &retval) {
@@ -417,15 +553,6 @@ int Thread::get_name(cpp::StringStream &name) const {
   return ERANGE;
 }
 
-// Reads the current value of the "gp" register, which we need to copy into
-// each new thread we create since it's supposed to be constant for the
-// whole runtime of the program.
-__attribute__((always_inline)) static uint64_t get_gp_register() {
-  uint64_t ret;
-  asm("mv %[RET], gp" : [RET] "=r"(ret) : : "gp");
-  return ret;
-}
-
 int AppProperties::ensure_multithreaded() {
   if (this->is_multithreaded()) {
     // Nothing to do then: we already set up multithreading in a
@@ -446,22 +573,22 @@ int AppProperties::ensure_multithreaded() {
       return ENOMEM;
   }
 
-  // The main thread now gets a ThreadTracker allocated to represent it in
-  // the multithreading system. This will be the first ThreadTracker and
-  // initially the only one, though it's likely that whoever called this
-  // function is about to allocate another.
-  {
-    AllocChecker ac;
-    state->running_thread = new (ac) ThreadTracker();
-    if (!ac) {
-      delete state; // don't leak the AppThreading we already allocated
-      return ENOMEM;
-    }
-  }
-  // The main thread doesn't have a memory block because its stack
-  // is the main stack provided by the RISCovite supervisor, and
-  // its ThreadTracker object lives on the main heap.
-  state->running_thread->memblock_hnd_num = 0;
+  // The main thread's ThreadTracker lives inside our AppThreading object
+  // just because all of the other per-thread data for it is already elsewhere
+  // by the time we get here, and so the layout we'd use for non-main threads
+  // doesn't make sense for this one.
+  auto main_thread = &state->main;
+  main_thread->memblock_hnd_num = 0;
+
+  // The main thread is initially the running thread, and also the only
+  // member of the runnable threads list. (It's likely that whoever called
+  // this function is about to add another thread to the list, though.)
+  state->running_thread = main_thread;
+  state->push_runnable_head(main_thread);
+  // Since the main thread is currently running, it doesn't yet have a
+  // ThreadState object. That'll get created the first time we thread-switch
+  // away from the main thread, by the interrupt handler pushing it onto the
+  // main thread's stack.
 
   // We also need a software interrupt to use to force entry into the
   // thread-switching code when a thread becomes non-runnable and so needs
@@ -469,10 +596,11 @@ int AppProperties::ensure_multithreaded() {
   auto intr_hnd_num_result =
       syscall_impl<uint64_t>(RISCOVITE_SYS_CREATE_TASK_SOFTWARE_INTERRUPT,
                              (uint64_t)&thread_switching_interrupt_handler<
-                                 force_thread_switch_handler>);
+                                 force_thread_switch_handler>,
+                             (uint64_t)PREEMPT_INTERRUPT_PRIORITY);
   if (intr_hnd_num_result.error != 0) {
-    // We need to free the two memory objects we already allocated.
-    delete state->running_thread;
+    // We need to free the state objects we already allocated to avoid leaking
+    // it.
     delete state;
     return (int)intr_hnd_num_result.error;
   }
@@ -493,6 +621,89 @@ int AppProperties::ensure_multithreaded() {
   // change it again.
   this->threading.store(state);
   return 0;
+}
+
+// This must only be called from the methods of ThreadList, when they
+// already have interrupts disabled.
+static void detach_thread_list_item(ThreadListMember *m) {
+  if (m->next == nullptr) {
+    // Not currently in a list, so nothing to do.
+    return;
+  }
+  m->next->prev = m->prev;
+  m->prev->next = m->next;
+  m->next = nullptr;
+  m->prev = nullptr;
+}
+
+template <size_t OFFSET> void ThreadList<OFFSET>::push_head(ThreadTracker *t) {
+  bool int_en = disable_interrupts();
+  auto m = ThreadList<OFFSET>::member_for_tracker(t);
+  detach_thread_list_item(m);
+  m->prev = &this->head;
+  m->next = this->head.next;
+  m->next->prev = m;
+  m->prev->next = m;
+  set_interrupt_enable(int_en);
+}
+
+template <size_t OFFSET> void ThreadList<OFFSET>::push_tail(ThreadTracker *t) {
+  bool int_en = disable_interrupts();
+  auto m = ThreadList<OFFSET>::member_for_tracker(t);
+  detach_thread_list_item(m);
+  m->next = &this->head;
+  m->prev = this->head.prev;
+  m->prev->next = m;
+  m->next->prev = m;
+  set_interrupt_enable(int_en);
+}
+
+template <size_t OFFSET>
+bool ThreadList<OFFSET>::push_sole_member(ThreadTracker *t) {
+  bool int_en = disable_interrupts();
+  bool can_push = this->is_empty();
+  if (can_push) {
+    auto m = ThreadList<OFFSET>::member_for_tracker(t);
+    detach_thread_list_item(m);
+    this->head.next = m;
+    this->head.prev = m;
+    m->next = &this->head;
+    m->prev = &this->head;
+  }
+  set_interrupt_enable(int_en);
+  return can_push;
+}
+
+template <size_t OFFSET>
+void ThreadList<OFFSET>::insert_with_wake_time(ThreadTracker *t,
+                                               uint64_t wake_time) {
+  bool int_en = disable_interrupts();
+  t->wake_time = wake_time;
+  auto head = &this->head;
+  auto m = ThreadList<OFFSET>::member_for_tracker(t);
+  detach_thread_list_item(m);
+  ThreadListMember *insert_after = head->prev;
+  for (auto current = head->next; current != head; current = current->next) {
+    auto current_t = ThreadList<OFFSET>::tracker_for_member(current);
+    if (current_t->wake_time > wake_time) {
+      // This item has a later wait time than the one we're inserting, so
+      // we'll insert after its predecessor.
+      insert_after = current->prev;
+      break;
+    }
+  }
+  m->prev = insert_after;
+  m->next = insert_after->next;
+  insert_after->next->prev = m;
+  insert_after->next = m;
+  set_interrupt_enable(int_en);
+}
+
+template <size_t OFFSET> void ThreadList<OFFSET>::remove(ThreadTracker *t) {
+  bool int_en = disable_interrupts();
+  auto m = ThreadList<OFFSET>::member_for_tracker(t);
+  detach_thread_list_item(m);
+  set_interrupt_enable(int_en);
 }
 
 } // namespace LIBC_NAMESPACE_DECL

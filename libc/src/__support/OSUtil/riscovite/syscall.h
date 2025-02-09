@@ -23,9 +23,14 @@
 namespace LIBC_NAMESPACE_DECL {
 
 template <typename R, typename... Ts>
+
 LIBC_INLINE SyscallResult<R> syscall_impl(long __number, Ts... ts) {
   static_assert(sizeof...(Ts) <= 6, "Too many arguments for syscall");
   return SyscallResult<R>(syscall_impl(__number, (long)ts...));
+}
+
+LIBC_INLINE constexpr uint64_t syscall_iface_func_num(uint8_t slot_num, uint32_t func_num) {
+  return ~((uint64_t)(slot_num) | ((uint64_t)(func_num) << 4));
 }
 
 } // namespace LIBC_NAMESPACE_DECL

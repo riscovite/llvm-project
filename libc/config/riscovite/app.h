@@ -25,7 +25,7 @@ namespace LIBC_NAMESPACE_DECL {
 // interrupt handler, but we extend it with some additional fields on the
 // front to capture the remaining general-purpose register values that are
 // not included in the exception stack frame due to being callee-saved.
-struct ThreadState {
+struct __attribute__((aligned(16))) ThreadState {
   // The value of the thread pointer register (x4) for this thread.
   //
   // This points to the byte immediately after the thread control block,
@@ -94,6 +94,67 @@ struct ThreadState {
   }
 };
 
+struct ThreadListMember {
+  ThreadListMember *prev;
+  ThreadListMember *next;
+};
+
+// Forward-declaration because ThreadTracker and ThreadList refer to each other.
+struct __attribute__((aligned(16))) ThreadTracker;
+
+// The head of a double-linked list of [ThreadTracker] objects.
+//
+// The tail of the list is in head->prev. head is always equal to
+// head->prev->next when the list is in a consistent state. Interrupts must
+// always be disabled when accessing the list so that it can only be viewed
+// in an inconsistent state by code that's currently modifying it.
+template <size_t LIST_MEMBER_OFFSET> struct ThreadList {
+  // The head.next field is the first item, while head.prev is the last item.
+  //
+  // The first and last items point to this list head to mark the start/end
+  // of the list.
+  ThreadListMember head;
+
+  LIBC_INLINE ThreadList() {
+    // An empty list is represented by the two head fields pointing back
+    // to the head again.
+    this->head.next = &this->head;
+    this->head.prev = &this->head;
+  }
+
+  // This must be called only with a ThreadListMember that actually represents
+  // a list item, and NEVER with the special member in "head".
+  static LIBC_INLINE ThreadTracker *tracker_for_member(ThreadListMember *m) {
+    return (ThreadTracker *)(((char *)m) - LIST_MEMBER_OFFSET);
+  }
+
+  static LIBC_INLINE ThreadListMember *member_for_tracker(ThreadTracker *t) {
+    return (ThreadListMember *)(((char *)t) + LIST_MEMBER_OFFSET);
+  }
+
+  LIBC_INLINE bool is_empty() { return this->head.next == &this->head; }
+  LIBC_INLINE ThreadTracker *first() {
+    if (this->is_empty()) {
+      return nullptr;
+    }
+    return ThreadList<LIST_MEMBER_OFFSET>::tracker_for_member(this->head.next);
+  }
+  // It's valid to call next only with a ThreadTracker that currently belongs
+  // to this list. Passing any other ThreadTracker has undefined behavior.
+  LIBC_INLINE ThreadTracker *next(ThreadTracker *current) {
+    auto m = ThreadList<LIST_MEMBER_OFFSET>::member_for_tracker(current);
+    if (m->next == &this->head) {
+      return nullptr; // current is the last item, so there is no next
+    }
+    return ThreadList<LIST_MEMBER_OFFSET>::tracker_for_member(m->next);
+  }
+  void push_head(ThreadTracker *t);
+  void push_tail(ThreadTracker *t);
+  bool push_sole_member(ThreadTracker *t);
+  void insert_with_wake_time(ThreadTracker *t, uint64_t wake_time);
+  void remove(ThreadTracker *t);
+};
+
 // Tracking information for a thread, allocated at the time of thread creation.
 //
 // RISCovite has no OS-level support for threads and instead we implement
@@ -103,24 +164,27 @@ struct ThreadState {
 struct __attribute__((aligned(16))) ThreadTracker {
   // When a thread is participating in a wait queue (which includes the queue
   // of runnable-but-not-yet-running threads), this field forms an invasive
-  // singly-linked list where each thread points to the thread that is after it
-  // in the queue.
+  // doubly-linked list where each thread points to the threads that are before
+  // and after it in the queue.
   //
   // When a thread is running this field has an unspecified value and it's
   // unsound to defreference it.
-  ThreadTracker *next_waiter;
+  //
+  // This must be the first field in ThreadTracker due to the hard-coded
+  // offset parameter on the type of field "joiners", below.
+  ThreadListMember waiters;
 
   // When a thread has asked to be suspended until some future time, this
-  // field forms an invasive singly-linked list over all such threads in
+  // field forms an invasive doubly-linked list over all such threads in
   // order of wake-up time, soonest first.
   //
-  // This is used both when a thread has requested to sleep and when it's
+  // This is used both when a thread has requested to sleep and when it is
   // in a wait queue for a synchronization primitive with an associated
   // timeout. In the latter case the next_waiter field is also active and
   // represents the position in the associated wait queue, so that the
   // task can be unsuspended either by acquiring a lock (for example) or
   // by time running out.
-  ThreadTracker *next_timed;
+  ThreadListMember timed_waiters;
 
   // When `next_timed` is participating in the timed wakeup queue, this
   // field records the time that the thread requested to be woken up.
@@ -139,6 +203,18 @@ struct __attribute__((aligned(16))) ThreadTracker {
   // is unsound to dereference any offset of this pointer in that case.
   ThreadState *state;
 
+  // List of threads that are waiting for this thread to terminate.
+  //
+  // This is a ThreadList for implementation convenience (since we use those
+  // elsewhere) but in practice there may be at most one thread in this list,
+  // because it's forbidden for two threads to try to join or detach the
+  // same other thread.
+  //
+  // This is a ThreadWaitList, but instantiated directly using a hard-coded
+  // offset because we can't compute the offset of "timed_waiters" using
+  // offsetof until we've completed this decl.
+  ThreadList<0> joiners;
+
   // The handle number for the memory block containing this thread's stack,
   // thread local storage descriptor, and this very tracking object.
   //
@@ -148,10 +224,8 @@ struct __attribute__((aligned(16))) ThreadTracker {
   uint64_t memblock_hnd_num;
 };
 
-// The head of a singly-linked list of [ThreadTracker] objects.
-struct ThreadList {
-  ThreadTracker *head;
-};
+using ThreadWaitList = ThreadList<offsetof(ThreadTracker, waiters)>;
+using ThreadTimedWaitList = ThreadList<offsetof(ThreadTracker, timed_waiters)>;
 
 // The number of additional bytes needed in the memory block containing a
 // thread's stack for both the tracking object and the state information
@@ -238,7 +312,7 @@ struct AppThreading {
   //
   // On entry into main there is only the one main thread which is tracked
   // in running_thread, and there are therefore no runnable threads.
-  ThreadList runnable_threads;
+  ThreadWaitList runnable_threads;
 
   // A singly-linked list of threads that want to become runnable again at
   // a particular time in the future, in order of requested wakeup time with
@@ -247,7 +321,7 @@ struct AppThreading {
   // A thread in this list may or may not also be in a wait queue for a
   // synchronization primitive. If it is then it could be awakened by either
   // the wait queue this time-wait list, depending on which event occurs first.
-  ThreadList time_waiting_threads;
+  ThreadTimedWaitList time_waiting_threads;
 
   // The handle number of a software interrupt object used to force immediate
   // entry into the thread-switching code. The thread-switching code can also
@@ -257,6 +331,11 @@ struct AppThreading {
   // The software interrupt this refers to must have the same interrupt priority
   // as the timer interrupt, to ensure that one cannot preempt the other.
   uint64_t thread_switch_hnd_num;
+
+  // ThreadTracker for the main thread, whose stack and thread control block
+  // are both already active when we switch into threaded mode, and so we
+  // only need the additional ThreadTracker to represent it.
+  ThreadTracker main;
 
   // ThreadTracker for the idle thread, which runs when none of the real threads
   // are runnable. This thread's ThreadState pointer always points into
@@ -268,6 +347,28 @@ struct AppThreading {
   // small content that might be placed in the stack frame of the idle thread's
   // function by the compiler.
   alignas(16) char idle_stack[64 + sizeof(ThreadState)];
+
+  LIBC_INLINE void push_runnable_head(ThreadTracker *t) {
+    this->runnable_threads.push_head(t);
+  }
+  LIBC_INLINE void push_runnable_tail(ThreadTracker *t) {
+    this->runnable_threads.push_tail(t);
+  }
+  LIBC_INLINE void remove_runnable(ThreadTracker *t) {
+    this->runnable_threads.remove(t);
+  }
+  LIBC_INLINE void insert_time_waiter(ThreadTracker *t, uint64_t wake_time) {
+    this->time_waiting_threads.insert_with_wake_time(t, wake_time);
+  }
+  LIBC_INLINE void remove_time_waiter(ThreadTracker *t) {
+    this->time_waiting_threads.remove(t);
+  }
+  LIBC_INLINE ThreadTracker *next_runnable() {
+    return this->runnable_threads.first();
+  }
+  LIBC_INLINE ThreadTracker *next_time_waiter() {
+    return this->time_waiting_threads.first();
+  }
 };
 
 // Data structure which captures properties of a RISCovite application.
