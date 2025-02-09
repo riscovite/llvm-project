@@ -164,8 +164,7 @@ void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
   }
 
   self.attrib = &main_thread_attrib;
-  // TODO: Enable this once we have a thread.cpp support implementation for RISCovite
-  //main_thread_attrib.atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
+  main_thread_attrib.atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
 
   atexit(call_fini_array_callbacks);
 

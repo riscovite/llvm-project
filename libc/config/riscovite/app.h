@@ -97,6 +97,8 @@ struct __attribute__((aligned(16))) ThreadState {
 struct ThreadListMember {
   ThreadListMember *prev;
   ThreadListMember *next;
+
+  void detach();
 };
 
 // Forward-declaration because ThreadTracker and ThreadList refer to each other.

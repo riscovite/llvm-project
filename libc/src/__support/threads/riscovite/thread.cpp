@@ -49,27 +49,24 @@ static constexpr ErrorOr<size_t> round_for_stack(size_t v) {
 }
 
 void thread_startup_posix(void *arg, ThreadRunnerPosix runner,
-                          ThreadTracker *tracker) {
+                          ThreadTracker *tracker, ThreadAttributes *attrs) {
   (void)tracker;
+  attrs->atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
+  self.attrib = attrs;
   void *result = runner(arg);
-  // TODO: Either shut down the thread or mark it as complete so
-  // another thread can "join" it, depending on its settings.
-  printf("POSIX-style thread exited with %p\n", result);
-  for (;;) {
-    asm volatile("wfi");
-  }
+  attrs->retval.posix_retval = result;
+  thread_exit(ThreadReturnValue(attrs->retval.posix_retval),
+              ThreadStyle::POSIX);
 }
 
 void thread_startup_stdc(void *arg, ThreadRunnerStdc runner,
-                         ThreadTracker *tracker) {
+                         ThreadTracker *tracker, ThreadAttributes *attrs) {
   (void)tracker;
+  attrs->atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
+  self.attrib = attrs;
   int result = runner(arg);
-  // TODO: Either shut down the thread or mark it as complete so
-  // another thread can "join" it, depending on its settings.
-  printf("StdC-style thread exited with %d\n", result);
-  for (;;) {
-    asm volatile("wfi");
-  }
+  attrs->retval.stdc_retval = result;
+  thread_exit(ThreadReturnValue(attrs->retval.stdc_retval), ThreadStyle::STDC);
 }
 
 // A pointer to a function implementing an interrupt handler for switching
@@ -336,6 +333,12 @@ static ThreadState *switch_threads(ThreadState *current_state,
                                (uint64_t)PREEMPT_INTERRUPT_PRIORITY);
     (void)result; // Can't really do anything if the timer setup fails, but it
                   // ought not to
+  } else {
+    // Clear any timer we might have configured previously.
+    auto result =
+        syscall_impl<uint64_t>(RISCOVITE_SYS_SET_TIMER_INTERRUPT, 0, 0, 0);
+    (void)result; // Can't really do anything if the timer setup fails, but it
+                  // ought not to
   }
 
   return global_state->running_thread->state;
@@ -463,7 +466,8 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   if (owned_stack) {
     stack = memblock_start;
   }
-  effective_stack_size &= ~0xf; // round down to nearest 16 bytes for ABI-required stack alignment
+  effective_stack_size &=
+      ~0xf; // round down to nearest 16 bytes for ABI-required stack alignment
   void *stack_end = (char *)stack + effective_stack_size;
   tracker->memblock_hnd_num = memblock_hnd_num;
 
@@ -500,6 +504,7 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   state->s[0] = state->sp; // optional frame pointer, in case something needs it
   state->a[0] = (uint64_t)arg;
   state->a[2] = (uint64_t)tracker;
+  state->a[3] = (uint64_t)attrs;
   switch (style) {
   case ThreadStyle::POSIX:
     state->pc = (uint64_t)&thread_startup_posix;
@@ -551,6 +556,48 @@ int Thread::get_name(cpp::StringStream &name) const {
   // TODO: Implement
   (void)name;
   return ERANGE;
+}
+
+void thread_exit(ThreadReturnValue retval, ThreadStyle style) {
+  (void)style;
+  auto attrib = self.attrib;
+
+  // The very first thing we do is to call the thread's atexit callbacks.
+  // These callbacks could be the ones registered by the language runtimes,
+  // for example, the destructors of thread local objects. They can also
+  // be destructors of the TSS objects set using API like pthread_setspecific.
+  // NOTE: We cannot call the atexit callbacks as part of the
+  // cleanup_thread_resources function as that function can be called from a
+  // different thread. The destructors of thread local and TSS objects should
+  // be called by the thread which owns them.
+  internal::call_atexit_callbacks(attrib);
+
+  uint32_t joinable_state = uint32_t(DetachState::JOINABLE);
+  if (!attrib->detach_state.compare_exchange_strong(
+          joinable_state, uint32_t(DetachState::EXITING))) {
+    // Thread is detached, so we should clean up immediately.
+    // TODO: decide how to handle this, since cleaning this up
+    // will free the stack we're currently using and thus we
+    // won't be able to safely run C++ code anymore.
+    // cleanup_thread_resources(attrib);
+
+    for (;;) {
+      asm volatile("wfi");
+    }
+  }
+
+  // If we get here then our thread is joinable and so we just need to
+  // remove it from all ready/wait lists and yield our timeslice, and
+  // then our state will hang around until another thread joins with this
+  // one and cleans up its resources.
+  attrib->retval = retval;
+  auto tracker = (ThreadTracker *)attrib->platform_data;
+  tracker->waiters.detach();
+  tracker->timed_waiters.detach();
+  yield_timeslice(app.multithreading_state());
+  // We removed ourselves from all waiting lists before yielding, so there
+  // is no way for the thread to become runnable again.
+  __builtin_unreachable();
 }
 
 int AppProperties::ensure_multithreaded() {
@@ -703,6 +750,12 @@ template <size_t OFFSET> void ThreadList<OFFSET>::remove(ThreadTracker *t) {
   bool int_en = disable_interrupts();
   auto m = ThreadList<OFFSET>::member_for_tracker(t);
   detach_thread_list_item(m);
+  set_interrupt_enable(int_en);
+}
+
+void ThreadListMember::detach() {
+  bool int_en = disable_interrupts();
+  detach_thread_list_item(this);
   set_interrupt_enable(int_en);
 }
 
