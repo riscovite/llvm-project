@@ -208,28 +208,6 @@ thread_switching_interrupt_handler(uint64_t a0) {
       "s5", "s6", "s7", "s8", "s9", "s10", "s11");
 }
 
-/*
-__attribute__((always_inline)) static void set_interrupt_enable(bool enabled) {
-  asm volatile("csrw 0x800, %[ENABLED]" : : [ENABLED] "r"(enabled));
-}
-*/
-
-__attribute__((always_inline)) static bool disable_interrupts() {
-  uint64_t ret;
-  asm volatile("csrrwi %[RET], 0x800, 0" : [RET] "=r"(ret));
-  return ret;
-}
-
-__attribute__((always_inline)) static bool enable_interrupts() {
-  uint64_t ret;
-  asm volatile("csrrwi %[RET], 0x800, 1" : [RET] "=r"(ret));
-  return ret;
-}
-
-__attribute__((always_inline)) static void set_interrupt_enable(bool enabled) {
-  asm volatile("csrw 0x800, %[V]" : : [V] "r"(enabled));
-}
-
 static LIBC_INLINE void yield_timeslice(AppThreading *s) {
   constexpr uint64_t SYS_SET_INTERRUPT_PENDING =
       syscall_iface_func_num(0, 0x001);
@@ -242,13 +220,13 @@ static LIBC_INLINE void yield_timeslice(AppThreading *s) {
 __attribute__((noreturn)) void idle_thread() {
   auto s = app.multithreading_state();
   for (;;) {
-    disable_interrupts();
+    asm volatile("csrrwi x0, 0x800, 0"); // disable interrupts
     if (!s->runnable_threads.is_empty()) {
       // We'll set the "force-suspend" interrupt pending, so that once we
       // re-enable interrupts this idle thread should be suspended in favor
       // of whichever thread is at the head of the runnable list.
       yield_timeslice(s);
-      enable_interrupts();
+      asm volatile("csrrwi x0, 0x800, 1"); // enable interrupts
       // We should typically not resume executing here again until next time
       // there are no runnable threads.
       continue;
@@ -258,7 +236,7 @@ __attribute__((noreturn)) void idle_thread() {
     // sure that the runnable threads list can't become non-empty again before
     // we get a chance to sleep.
     asm volatile("wfi");
-    enable_interrupts();
+    asm volatile("csrrwi x0, 0x800, 1"); // enable interrupts
     // Interrupt handlers might now make other threads runnable before we
     // check again on the next iteration. We might even yield to another
     // thread here if one had been in the time-wait list and has now reached
@@ -279,40 +257,44 @@ static ThreadState *switch_threads(ThreadState *current_state,
   auto global_state = app.multithreading_state();
   global_state->running_thread->state = current_state;
 
-  ThreadTracker *current = global_state->time_waiting_threads.first();
-  while (current != nullptr) {
-    if (current->wake_time > current_time) {
-      break; // The time-wait list is ordered by wake time, so the rest must
-             // be in the future
+  {
+    auto d = disable_interrupts();
+    ThreadTracker *current = global_state->time_waiting_threads.first();
+    while (current != nullptr) {
+      if (current->wake_time > current_time) {
+        break; // The time-wait list is ordered by wake time, so the rest must
+               // be in the future
+      }
+      global_state->end_thread_wait(current, false);
+      current = global_state->time_waiting_threads.next(current);
     }
-    global_state->remove_time_waiter(current);
-    // The following both marks the thread as runnable and removes it from
-    // any other wait list it might have been participating in, since
-    // we use the same intrusive linked list fields for both wait lists
-    // and the runnable list.
-    global_state->push_runnable_tail(current);
-    // TODO: Also set the thread's a0 register to a value representing
-    // "timeout" so that when it resumes the lowest-level yield function
-    // can distinguish that from successfully acquiring whatever the
-    // thread was waiting for, if anything.
-    current = global_state->time_waiting_threads.next(current);
+    (void)d; // interrupts re-enabled here
   }
 
-  ThreadTracker *next = global_state->next_runnable();
   ThreadTracker *successor_runnable = nullptr;
-  if (next != nullptr) {
-    successor_runnable = global_state->runnable_threads.next(next);
-    global_state->running_thread = next;
-    global_state->runnable_threads.push_tail(next);
-  } else {
-    // Nothing is runnable, so we'll switch to the idle task.
-    global_state->running_thread = &global_state->idle;
+  {
+    auto d = disable_interrupts();
+    ThreadTracker *next = global_state->next_runnable();
+    if (next != nullptr) {
+      successor_runnable = global_state->runnable_threads.next(next);
+      global_state->running_thread = next;
+      global_state->runnable_threads.push_tail(next, d);
+    } else {
+      // Nothing is runnable, so we'll switch to the idle task.
+      global_state->running_thread = &global_state->idle;
+    }
+    (void)d; // interrupts re-enabled here
   }
 
   // If there's either another runnable thread or a time-waiting thread
   // then we'll ask the supervisor to preempt the new thread at the
   // appropriate future time.
-  auto successor_timed_wait = global_state->next_time_waiter();
+  ThreadTracker *successor_timed_wait = nullptr;
+  {
+    auto d = disable_interrupts();
+    successor_timed_wait = global_state->next_time_waiter();
+    (void)d; // interrupts re-enabled here
+  }
   if (successor_runnable != nullptr || successor_timed_wait != nullptr) {
     // 4ms is the default timeslice. TODO: Make this customizable?
     uint64_t preempt_time = current_time + 4000000;
@@ -409,6 +391,11 @@ __attribute__((always_inline)) static uint64_t get_gp_register() {
   return ret;
 }
 
+static void cleanup_thread_resources(ThreadAttributes *attrs) {
+  // TODO: Implement
+  (void)attrs;
+}
+
 int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
                 size_t stacksize, size_t guardsize, bool detached) {
   // The first call to Thread::run switches the app into multithreaded mode.
@@ -459,7 +446,9 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   // followed by the TLS data, then ThreadAttributes, and then finally our
   // ThreadTracker object.
   ThreadTracker *tracker = ((ThreadTracker *)memblock_end) - 1;
+  new (tracker) ThreadTracker();
   ThreadAttributes *attrs = ((ThreadAttributes *)tracker) - 1;
+  new (attrs) ThreadAttributes();
   void *tls_base = ((char *)attrs) - tls_alloc_size;
   size_t effective_stack_size =
       owned_stack ? (char *)tls_base - (char *)memblock_start : stacksize;
@@ -519,16 +508,23 @@ int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
   // Now we'll set the new thread as runnable and yield this thread's own
   // timeslice so that it can begin running.
   auto threading_state = app.multithreading_state();
-  threading_state->push_runnable_head(tracker);
+  threading_state->set_thread_runnable(tracker);
   yield_timeslice(threading_state);
 
   return 0;
 }
 
 int Thread::join(ThreadReturnValue &retval) {
-  // TODO: Implement
-  (void)retval;
-  return ENOENT;
+  this->wait();
+
+  if (this->attrib->style == ThreadStyle::POSIX)
+    retval.posix_retval = this->attrib->retval.posix_retval;
+  else
+    retval.stdc_retval = this->attrib->retval.stdc_retval;
+
+  cleanup_thread_resources(this->attrib);
+
+  return 0;
 }
 
 int Thread::detach() {
@@ -537,7 +533,21 @@ int Thread::detach() {
 }
 
 void Thread::wait() {
-  // TODO: Implement
+  auto mtstate = app.multithreading_state();
+  for (;;) {
+    auto d = disable_interrupts();
+    auto tracker = (ThreadTracker *)this->attrib->platform_data;
+    if (tracker->complete) {
+      (void)d; // interrupts re-enabled here
+      return;
+    }
+    // If we get here then the thread isn't complete yet and so we'll
+    // add the current thread as its waiter and yield our timeslice.
+    auto current_tracker = (ThreadTracker *)self.attrib->platform_data;
+    mtstate->set_thread_waiting(current_tracker, &tracker->exit_waiters);
+    yield_timeslice(app.multithreading_state());
+    (void)d; // interrupts re-enabled here
+  }
 }
 
 bool Thread::operator==(const Thread &thread) const {
@@ -579,7 +589,7 @@ void thread_exit(ThreadReturnValue retval, ThreadStyle style) {
     // TODO: decide how to handle this, since cleaning this up
     // will free the stack we're currently using and thus we
     // won't be able to safely run C++ code anymore.
-    // cleanup_thread_resources(attrib);
+    cleanup_thread_resources(attrib);
 
     for (;;) {
       asm volatile("wfi");
@@ -590,14 +600,31 @@ void thread_exit(ThreadReturnValue retval, ThreadStyle style) {
   // remove it from all ready/wait lists and yield our timeslice, and
   // then our state will hang around until another thread joins with this
   // one and cleans up its resources.
-  attrib->retval = retval;
-  auto tracker = (ThreadTracker *)attrib->platform_data;
-  tracker->waiters.detach();
-  tracker->timed_waiters.detach();
-  yield_timeslice(app.multithreading_state());
+  auto mtstate = app.multithreading_state();
+  {
+    auto d = disable_interrupts();
+    attrib->retval = retval;
+    auto tracker = (ThreadTracker *)attrib->platform_data;
+    tracker->waiters.detach(d);
+    tracker->timed_waiters.detach(d);
+    tracker->complete = true;
+    // Any other threads that were waiting for this one to terminate get
+    // re-awakened now, with their a0 set to 1 to signal that they they
+    // got what they were waiting for without hitting a timeout.
+    for (auto current = tracker->exit_waiters.first(); current != nullptr;
+         current = tracker->exit_waiters.next(current)) {
+      mtstate->end_thread_wait(current, true);
+    }
+    yield_timeslice(
+        mtstate); // won't actually yield until we reenable interrupts
+    (void)d;      // interrupts re-enabled here
+  }
   // We removed ourselves from all waiting lists before yielding, so there
-  // is no way for the thread to become runnable again.
-  __builtin_unreachable();
+  // should be no way for the thread to become runnable again, but we'll
+  // guard here just in case.
+  for (;;) {
+    asm volatile("wfi");
+  }
 }
 
 int AppProperties::ensure_multithreaded() {
@@ -631,7 +658,7 @@ int AppProperties::ensure_multithreaded() {
   // member of the runnable threads list. (It's likely that whoever called
   // this function is about to add another thread to the list, though.)
   state->running_thread = main_thread;
-  state->push_runnable_head(main_thread);
+  state->set_thread_runnable(main_thread);
   // Since the main thread is currently running, it doesn't yet have a
   // ThreadState object. That'll get created the first time we thread-switch
   // away from the main thread, by the interrupt handler pushing it onto the
@@ -662,6 +689,12 @@ int AppProperties::ensure_multithreaded() {
   idle_state->sp = (uint64_t)idle_stack_sp;
   idle_state->gp = get_gp_register();
 
+  // We'll need to make the main thread's attributes now look a little more
+  // "realistic" so that our threading system can treat it the same as any
+  // other thread.
+  self.attrib->platform_data = main_thread;
+  self.attrib->owned_stack = false;
+
   // If we got this far then we've successfully set up the multithreading
   // state, so we can store the pointer to record that multithreading is
   // now active. Once we've stored a non-null pointer here we must never
@@ -670,9 +703,8 @@ int AppProperties::ensure_multithreaded() {
   return 0;
 }
 
-// This must only be called from the methods of ThreadList, when they
-// already have interrupts disabled.
-static void detach_thread_list_item(ThreadListMember *m) {
+static void detach_thread_list_item(ThreadListMember *m,
+                                    const InterruptsDisabled &d) {
   if (m->next == nullptr) {
     // Not currently in a list, so nothing to do.
     return;
@@ -681,82 +713,143 @@ static void detach_thread_list_item(ThreadListMember *m) {
   m->prev->next = m->next;
   m->next = nullptr;
   m->prev = nullptr;
+  (void)d;
 }
 
-template <size_t OFFSET> void ThreadList<OFFSET>::push_head(ThreadTracker *t) {
-  bool int_en = disable_interrupts();
-  auto m = ThreadList<OFFSET>::member_for_tracker(t);
-  detach_thread_list_item(m);
-  m->prev = &this->head;
-  m->next = this->head.next;
-  m->next->prev = m;
-  m->prev->next = m;
-  set_interrupt_enable(int_en);
+// The following three functions sometimes generate false-positive
+// -Wunneeded-internal-declaration, possibly due to inlining?
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunneeded-internal-declaration"
+
+static void insert_thread_list_item_before(ThreadListMember *to_insert,
+                                           ThreadListMember *before,
+                                           const InterruptsDisabled &d) {
+  to_insert->next = before;
+  to_insert->prev = before->prev;
+  to_insert->next->prev = to_insert;
+  to_insert->prev->next = to_insert;
+  (void)d;
 }
 
-template <size_t OFFSET> void ThreadList<OFFSET>::push_tail(ThreadTracker *t) {
-  bool int_en = disable_interrupts();
+static void insert_thread_list_item_after(ThreadListMember *to_insert,
+                                          ThreadListMember *after,
+                                          const InterruptsDisabled &d) {
+  to_insert->prev = after;
+  to_insert->next = after->next;
+  to_insert->next->prev = to_insert;
+  to_insert->prev->next = to_insert;
+  (void)d;
+}
+
+static void insert_thread_list_item_time_wait(ThreadTracker *to_insert,
+                                              ThreadTimedWaitList *list,
+                                              const InterruptsDisabled &d) {
+  auto wake_time = to_insert->wake_time;
+  auto to_insert_m = list->member_for_tracker(to_insert);
+  // We need either to find the first thread in the list that has a later wake
+  // time than the one we're inserting and insert just before it, or place
+  // our item at the tail of the list.
+  auto current = list->first();
+  for (; current != nullptr;
+       current = list->next(current)) {
+    if (current->wake_time > wake_time) {
+      // We'll insert before this one, then.
+      auto insert_before = list->member_for_tracker(current);
+      insert_thread_list_item_before(to_insert_m, insert_before, d);
+      return;
+    }
+  }
+  // If we fall out here then we didn't find any thread with a later
+  // wake_time than ours, so we'll just place our item at the end of
+  // the list, or (in other words) "before" the list head.
+  insert_thread_list_item_before(to_insert_m, &list->head, d);
+}
+
+#pragma GCC diagnostic pop // no longer ignoring "-Wunneeded-internal-declaration"
+
+template <size_t OFFSET>
+void ThreadList<OFFSET>::push_head(ThreadTracker *t,
+                                   const InterruptsDisabled &d) {
   auto m = ThreadList<OFFSET>::member_for_tracker(t);
-  detach_thread_list_item(m);
-  m->next = &this->head;
-  m->prev = this->head.prev;
-  m->prev->next = m;
-  m->next->prev = m;
-  set_interrupt_enable(int_en);
+  detach_thread_list_item(m, d);
+  insert_thread_list_item_after(m, &this->head, d);
+  (void)d;
 }
 
 template <size_t OFFSET>
-bool ThreadList<OFFSET>::push_sole_member(ThreadTracker *t) {
-  bool int_en = disable_interrupts();
+void ThreadList<OFFSET>::push_tail(ThreadTracker *t,
+                                   const InterruptsDisabled &d) {
+  auto m = ThreadList<OFFSET>::member_for_tracker(t);
+  detach_thread_list_item(m, d);
+  insert_thread_list_item_before(m, &this->head, d);
+  (void)d;
+}
+
+template <size_t OFFSET>
+bool ThreadList<OFFSET>::push_sole_member(ThreadTracker *t,
+                                          const InterruptsDisabled &d) {
   bool can_push = this->is_empty();
   if (can_push) {
     auto m = ThreadList<OFFSET>::member_for_tracker(t);
-    detach_thread_list_item(m);
-    this->head.next = m;
-    this->head.prev = m;
-    m->next = &this->head;
-    m->prev = &this->head;
+    detach_thread_list_item(m, d);
+    insert_thread_list_item_after(m, &this->head, d);
   }
-  set_interrupt_enable(int_en);
+  (void)d;
   return can_push;
 }
 
 template <size_t OFFSET>
-void ThreadList<OFFSET>::insert_with_wake_time(ThreadTracker *t,
-                                               uint64_t wake_time) {
-  bool int_en = disable_interrupts();
-  t->wake_time = wake_time;
-  auto head = &this->head;
+void ThreadList<OFFSET>::remove(ThreadTracker *t, const InterruptsDisabled &d) {
   auto m = ThreadList<OFFSET>::member_for_tracker(t);
-  detach_thread_list_item(m);
-  ThreadListMember *insert_after = head->prev;
-  for (auto current = head->next; current != head; current = current->next) {
-    auto current_t = ThreadList<OFFSET>::tracker_for_member(current);
-    if (current_t->wake_time > wake_time) {
-      // This item has a later wait time than the one we're inserting, so
-      // we'll insert after its predecessor.
-      insert_after = current->prev;
-      break;
-    }
-  }
-  m->prev = insert_after;
-  m->next = insert_after->next;
-  insert_after->next->prev = m;
-  insert_after->next = m;
-  set_interrupt_enable(int_en);
+  detach_thread_list_item(m, d);
+  (void)d;
 }
 
-template <size_t OFFSET> void ThreadList<OFFSET>::remove(ThreadTracker *t) {
-  bool int_en = disable_interrupts();
-  auto m = ThreadList<OFFSET>::member_for_tracker(t);
-  detach_thread_list_item(m);
-  set_interrupt_enable(int_en);
+void ThreadListMember::detach(const InterruptsDisabled &d) {
+  detach_thread_list_item(this, d);
+  (void)d;
 }
 
-void ThreadListMember::detach() {
-  bool int_en = disable_interrupts();
-  detach_thread_list_item(this);
-  set_interrupt_enable(int_en);
+void AppThreading::set_thread_waiting(ThreadTracker *t,
+                                      ThreadWaitList *wait_list) {
+  auto d = disable_interrupts();
+  wait_list->push_tail(t, d);
+  t->timed_waiters.detach(d); // no deadline
+  (void)d;
+}
+
+void AppThreading::set_thread_waiting_deadline(ThreadTracker *t,
+                                               ThreadWaitList *wait_list,
+                                               uint64_t deadline) {
+  auto d = disable_interrupts();
+  t->wake_time = deadline;
+  wait_list->push_tail(t, d);
+  insert_thread_list_item_time_wait(t, &this->time_waiting_threads, d);
+  (void)d;
+}
+
+void AppThreading::set_thread_sleeping(ThreadTracker *t, uint64_t deadline) {
+  auto d = disable_interrupts();
+  t->wake_time = deadline;
+  // not runnable or waiting for anything except the deadline
+  t->waiters.detach(d);
+  insert_thread_list_item_time_wait(t, &this->time_waiting_threads, d);
+  (void)d;
+}
+
+void AppThreading::set_thread_runnable(ThreadTracker *t) {
+  auto d = disable_interrupts();
+  t->timed_waiters.detach(d);
+  this->runnable_threads.push_tail(t, d);
+  (void)d;
+}
+
+void AppThreading::end_thread_wait(ThreadTracker *t, bool succeeded) {
+  auto d = disable_interrupts();
+  t->timed_waiters.detach(d);
+  this->runnable_threads.push_tail(t, d);
+  t->state->a[0] = succeeded ? 1 : 0;
+  (void)d;
 }
 
 } // namespace LIBC_NAMESPACE_DECL

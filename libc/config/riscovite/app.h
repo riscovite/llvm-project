@@ -18,6 +18,45 @@
 
 namespace LIBC_NAMESPACE_DECL {
 
+// Instances of this act as RAII guards for interrupts being disabled.
+//
+// Functions that must only be called with interrupts already disabled should
+// take an argument of this type to help callers prove that they have indeed
+// disabled interrupts.
+class InterruptsDisabled {
+private:
+  // Memory of the interrupt enable state when this object was created,
+  // to allow restoring that same state when this object is destroyed.
+  uint8_t restore;
+
+  // Moving and copying are not allowed. Pass InterruptDisabled by reference
+  // to functions that require their caller to have disabled interrupts.
+  InterruptsDisabled(const InterruptsDisabled &) = delete;
+  InterruptsDisabled(InterruptsDisabled &&) = delete;
+  InterruptsDisabled &operator=(const InterruptsDisabled &) = delete;
+  InterruptsDisabled &operator=(InterruptsDisabled &&) = delete;
+
+public:
+  LIBC_INLINE InterruptsDisabled() {
+    asm volatile("csrrwi %[RET], 0x800, 0" : [RET] "=r"(this->restore));
+  }
+
+  LIBC_INLINE ~InterruptsDisabled() {
+    asm volatile("csrw 0x800, %[V]" : : [V] "r"(this->restore));
+  }
+
+  // Returns true if interrupts were enabled before instantiating this object,
+  // and thus interrupts will be re-enabled again once this object is
+  // destroyed.
+  LIBC_INLINE bool previously_enabled() const { return this->restore != 0; }
+};
+
+// Disables interrupts and returns an RAII guard that will restore the
+// interrupt enable flag to its previous value once destroyed.
+LIBC_INLINE InterruptsDisabled disable_interrupts() {
+  return InterruptsDisabled();
+}
+
 // The saved state for a currently-suspended thread.
 //
 // Most of this structure is actually just the exception stack frame generated
@@ -98,7 +137,7 @@ struct ThreadListMember {
   ThreadListMember *prev;
   ThreadListMember *next;
 
-  void detach();
+  void detach(const InterruptsDisabled &d);
 };
 
 // Forward-declaration because ThreadTracker and ThreadList refer to each other.
@@ -117,12 +156,14 @@ template <size_t LIST_MEMBER_OFFSET> struct ThreadList {
   // of the list.
   ThreadListMember head;
 
-  LIBC_INLINE ThreadList() {
+  LIBC_INLINE void init() {
     // An empty list is represented by the two head fields pointing back
     // to the head again.
     this->head.next = &this->head;
     this->head.prev = &this->head;
   }
+
+  LIBC_INLINE ThreadList() { this->init(); }
 
   // This must be called only with a ThreadListMember that actually represents
   // a list item, and NEVER with the special member in "head".
@@ -150,11 +191,11 @@ template <size_t LIST_MEMBER_OFFSET> struct ThreadList {
     }
     return ThreadList<LIST_MEMBER_OFFSET>::tracker_for_member(m->next);
   }
-  void push_head(ThreadTracker *t);
-  void push_tail(ThreadTracker *t);
-  bool push_sole_member(ThreadTracker *t);
-  void insert_with_wake_time(ThreadTracker *t, uint64_t wake_time);
-  void remove(ThreadTracker *t);
+  void push_head(ThreadTracker *t, const InterruptsDisabled &d);
+  void push_tail(ThreadTracker *t, const InterruptsDisabled &d);
+  bool push_sole_member(ThreadTracker *t, const InterruptsDisabled &d);
+  void insert_with_wake_time(ThreadTracker *t, uint64_t wake_time, const InterruptsDisabled &d);
+  void remove(ThreadTracker *t, const InterruptsDisabled &d);
 };
 
 // Tracking information for a thread, allocated at the time of thread creation.
@@ -207,15 +248,18 @@ struct __attribute__((aligned(16))) ThreadTracker {
 
   // List of threads that are waiting for this thread to terminate.
   //
-  // This is a ThreadList for implementation convenience (since we use those
-  // elsewhere) but in practice there may be at most one thread in this list,
-  // because it's forbidden for two threads to try to join or detach the
-  // same other thread.
-  //
   // This is a ThreadWaitList, but instantiated directly using a hard-coded
   // offset because we can't compute the offset of "timed_waiters" using
   // offsetof until we've completed this decl.
-  ThreadList<0> joiners;
+  //
+  // All threads in this list will become runnable with their a0 set
+  // to 1 once the thread is complete. Adding a thread here after complete
+  // is already set to true is incorrect usage.
+  ThreadList<0> exit_waiters;
+
+  // Set to true once the thread exits, and thus once its result value
+  // (in the associated ThreadAttributes object) is ready to read.
+  bool complete;
 
   // The handle number for the memory block containing this thread's stack,
   // thread local storage descriptor, and this very tracking object.
@@ -350,27 +394,19 @@ struct AppThreading {
   // function by the compiler.
   alignas(16) char idle_stack[64 + sizeof(ThreadState)];
 
-  LIBC_INLINE void push_runnable_head(ThreadTracker *t) {
-    this->runnable_threads.push_head(t);
-  }
-  LIBC_INLINE void push_runnable_tail(ThreadTracker *t) {
-    this->runnable_threads.push_tail(t);
-  }
-  LIBC_INLINE void remove_runnable(ThreadTracker *t) {
-    this->runnable_threads.remove(t);
-  }
-  LIBC_INLINE void insert_time_waiter(ThreadTracker *t, uint64_t wake_time) {
-    this->time_waiting_threads.insert_with_wake_time(t, wake_time);
-  }
-  LIBC_INLINE void remove_time_waiter(ThreadTracker *t) {
-    this->time_waiting_threads.remove(t);
-  }
   LIBC_INLINE ThreadTracker *next_runnable() {
     return this->runnable_threads.first();
   }
   LIBC_INLINE ThreadTracker *next_time_waiter() {
     return this->time_waiting_threads.first();
   }
+
+  void set_thread_waiting(ThreadTracker *t, ThreadWaitList *wait_list);
+  void set_thread_waiting_deadline(ThreadTracker *t, ThreadWaitList *wait_list,
+                                   uint64_t deadline);
+  void set_thread_sleeping(ThreadTracker *t, uint64_t deadline);
+  void set_thread_runnable(ThreadTracker *t);
+  void end_thread_wait(ThreadTracker *t, bool succeeded);
 };
 
 // Data structure which captures properties of a RISCovite application.
