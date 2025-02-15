@@ -19,8 +19,8 @@
 #include "src/__support/macros/config.h"
 #include "src/errno/libc_errno.h" // For error macros
 
+#include <assert.h>
 #include <stdint.h>
-#include <stdio.h>
 
 namespace LIBC_NAMESPACE_DECL {
 
@@ -244,6 +244,45 @@ __attribute__((noreturn)) void idle_thread() {
   }
 }
 
+// The implementation of the "cleanup thread" that becomes current whenever
+// there are zombie threads that need their reources cleaned up.
+//
+// This is implemented like a thread mainly just to avoid doing this
+// potentially-expensive work in the main task-switching function with a nonzero
+// interrupt priority floor. In the current implementation it cannot actually
+// be preempted, so no other normal thread can run until it explicitly yields,
+// but interrupt handlers can still interrupt it.
+__attribute__((noreturn)) void cleanup_thread() {
+  auto s = app.multithreading_state();
+  for (;;) {
+    // Threads can only become "zombie" by exiting themselves, and since no
+    // other threads can run while we're in the cleanup thread we can assume
+    // that the zombie thread list is immutable whenever we have control here,
+    // and so we can safely leave interrupts active.
+    auto zombie = s->take_next_zombie();
+    if (zombie == nullptr) {
+      // If the zombie list is empty then we have nothing else to do, so
+      // we'll yield and let other threads run again until another zombie
+      // appears in the list.
+      yield_timeslice(s);
+      continue;
+    }
+
+    // All of a thread's privately-owned memory resources live together
+    // in a single memory block, and so freeing that block is sufficient
+    // to clean everything up. (The thread should have run all of its
+    // atexit code, destructors, etc before registering itself as a zombie.)
+    // We don't check the result of this call because if freeing the memory
+    // block fails there isn't really anything we can do about it; it should
+    // only be possible if our record of the thread's memory block has
+    // been corrupted somehow.
+    uint64_t memblock_hnd_num = zombie->memblock_hnd_num;
+    if (memblock_hnd_num != 0) {
+      syscall_impl<uint64_t>(RISCOVITE_SYS_CLOSE, memblock_hnd_num);
+    }
+  }
+}
+
 // Forward-declaration because switch_threads and preempt_thread_switch_handler
 // are mutually-dependent.
 static ThreadState *preempt_thread_switch_handler(uint64_t a0,
@@ -257,6 +296,19 @@ static ThreadState *switch_threads(ThreadState *current_state,
   auto global_state = app.multithreading_state();
   global_state->running_thread->state = current_state;
 
+  // The following code must be resilient to the following changes potentially
+  // made by interrupt handlers with higher priority than our task-switching
+  // ones:
+  // - Items being removed from the time-waiting list.
+  // - Items being added to the runnable threads list.
+  //
+  // Interrupt handlers other than our threading-related ones are prohibited
+  // from taking any actions that would cause any other kinds of change,
+  // however. The following code is probably more conservative than it really
+  // needs to be based on the above, and so we might be able to reduce the
+  // amount of time spent with interrupts disabled in future changes.
+
+  bool have_zombies = false;
   {
     auto d = disable_interrupts();
     ThreadTracker *current = global_state->time_waiting_threads.first();
@@ -265,17 +317,27 @@ static ThreadState *switch_threads(ThreadState *current_state,
         break; // The time-wait list is ordered by wake time, so the rest must
                // be in the future
       }
-      global_state->end_thread_wait(current, false);
-      current = global_state->time_waiting_threads.next(current);
+      current = global_state->end_thread_wait_timeout(
+          current, &global_state->time_waiting_threads);
     }
+    have_zombies = global_state->have_zombies(d);
     (void)d; // interrupts re-enabled here
   }
+
+  // This brief period with interrupts re-enabled can potentially allow
+  // an interrupt to add a new thread to the runnable list before we
+  // decide which thread to select next.
 
   ThreadTracker *successor_runnable = nullptr;
   {
     auto d = disable_interrupts();
     ThreadTracker *next = global_state->next_runnable();
-    if (next != nullptr) {
+    if (have_zombies) {
+      // If there's at least one zombie thread awaiting cleanup
+      // then the cleanup thread gets control regardless of
+      // what else might be going on.
+      global_state->running_thread = &global_state->cleanup;
+    } else if (next != nullptr) {
       successor_runnable = global_state->runnable_threads.next(next);
       global_state->running_thread = next;
       global_state->runnable_threads.push_tail(next, d);
@@ -289,23 +351,31 @@ static ThreadState *switch_threads(ThreadState *current_state,
   // If there's either another runnable thread or a time-waiting thread
   // then we'll ask the supervisor to preempt the new thread at the
   // appropriate future time.
-  ThreadTracker *successor_timed_wait = nullptr;
-  {
+  uint64_t timed_wait_time = 0;
+  if (!have_zombies) {
     auto d = disable_interrupts();
-    successor_timed_wait = global_state->next_time_waiter();
+    auto successor_timed_wait = global_state->next_time_waiter();
+    if (successor_timed_wait != nullptr) {
+      timed_wait_time = successor_timed_wait->wake_time;
+    }
+    // Note that other interrupt handlers are not allowed to _add_ time-waiters
+    // to the list, so our only potential concern is that the
+    // successor_timed_wait thread might stop time-waiting before we return
+    // from this function, but that just means we'll end up back in here earlier
+    // than we really needed to once the timer interrupt becomes pending.
     (void)d; // interrupts re-enabled here
   }
-  if (successor_runnable != nullptr || successor_timed_wait != nullptr) {
+  if (!have_zombies &&
+      (successor_runnable != nullptr || timed_wait_time != 0)) {
     // 4ms is the default timeslice. TODO: Make this customizable?
     uint64_t preempt_time = current_time + 4000000;
-    if (successor_runnable == nullptr &&
-        successor_timed_wait->wake_time > preempt_time) {
+    if (successor_runnable == nullptr && timed_wait_time > preempt_time) {
       // If there is no immediately-runnable task and the next time-waiter
       // is further than one standard timeslice in the future then we'll
       // extend the timeslice until the time-waiter's wait time.
       // TODO: Should we let a very-near-future waiter slightly truncate
       // the timeslice to let it wake up closer to the time it requested?
-      preempt_time = successor_runnable->wake_time;
+      preempt_time = timed_wait_time;
     }
 
     auto result =
@@ -323,6 +393,7 @@ static ThreadState *switch_threads(ThreadState *current_state,
                   // ought not to
   }
 
+  assert(!global_state->running_thread->complete);
   return global_state->running_thread->state;
 }
 
@@ -389,11 +460,6 @@ __attribute__((always_inline)) static uint64_t get_gp_register() {
   uint64_t ret;
   asm("mv %[RET], gp" : [RET] "=r"(ret) : : "gp");
   return ret;
-}
-
-static void cleanup_thread_resources(ThreadAttributes *attrs) {
-  // TODO: Implement
-  (void)attrs;
 }
 
 int Thread::run(ThreadStyle style, ThreadRunner runner, void *arg, void *stack,
@@ -522,14 +588,39 @@ int Thread::join(ThreadReturnValue &retval) {
   else
     retval.stdc_retval = this->attrib->retval.stdc_retval;
 
-  cleanup_thread_resources(this->attrib);
+  // When we join with a thread we assume responsibility for
+  // recording it as a zombie so that its resources will be
+  // cleanup up at the next task switch.
+  auto mtstate = app.multithreading_state();
+  auto tracker = (ThreadTracker *)this->attrib->platform_data;
+  mtstate->set_thread_zombie(tracker);
+
+  // Unfortunately we currently need to yield our timeslice
+  // here because the current thread might be the only thread
+  // currently runnable and so it won't get preempted and thus
+  // the zombie cleanup thread might never run.
+  // FIXME: Find a better solution for this, so that we don't
+  // have to yield timeslice twice just to join another thread.
+  yield_timeslice(mtstate);
 
   return 0;
 }
 
 int Thread::detach() {
-  // TODO: Implement
-  return int(DetachType::SIMPLE);
+  uint32_t joinable_state = uint32_t(DetachState::JOINABLE);
+  if (attrib->detach_state.compare_exchange_strong(
+          joinable_state, uint32_t(DetachState::DETACHED)))
+    return int(DetachType::SIMPLE);
+
+  // If the thread was already detached, then the detach method should not
+  // be called at all. If the thread is exiting, then we wait for it to exit
+  // and then register it as a zombie so that its owned data can be freed
+  // on the next thread switch.
+  this->wait();
+  auto mtstate = app.multithreading_state();
+  auto tracker = (ThreadTracker *)this->attrib->platform_data;
+  mtstate->set_thread_zombie(tracker);
+  return int(DetachType::CLEANUP);
 }
 
 void Thread::wait() {
@@ -551,9 +642,7 @@ void Thread::wait() {
 }
 
 bool Thread::operator==(const Thread &thread) const {
-  // TODO: Implement
-  (void)thread;
-  return false;
+  return thread.attrib == this->attrib;
 }
 
 int Thread::set_name(const cpp::string_view &name) {
@@ -571,59 +660,57 @@ int Thread::get_name(cpp::StringStream &name) const {
 void thread_exit(ThreadReturnValue retval, ThreadStyle style) {
   (void)style;
   auto attrib = self.attrib;
+  auto tracker = (ThreadTracker *)attrib->platform_data;
 
   // The very first thing we do is to call the thread's atexit callbacks.
   // These callbacks could be the ones registered by the language runtimes,
   // for example, the destructors of thread local objects. They can also
   // be destructors of the TSS objects set using API like pthread_setspecific.
   // NOTE: We cannot call the atexit callbacks as part of the
-  // cleanup_thread_resources function as that function can be called from a
-  // different thread. The destructors of thread local and TSS objects should
+  // cleanup thread because destructors of thread local and TSS objects must
   // be called by the thread which owns them.
   internal::call_atexit_callbacks(attrib);
 
+  auto mtstate = app.multithreading_state();
   uint32_t joinable_state = uint32_t(DetachState::JOINABLE);
   if (!attrib->detach_state.compare_exchange_strong(
           joinable_state, uint32_t(DetachState::EXITING))) {
-    // Thread is detached, so we should clean up immediately.
-    // TODO: decide how to handle this, since cleaning this up
-    // will free the stack we're currently using and thus we
-    // won't be able to safely run C++ code anymore.
-    cleanup_thread_resources(attrib);
-
+    // Thread is detached, so it becomes a zombie immediately, and
+    // we'll yield our timeslice to let the cleanup thread free
+    // the thread's privately-owned resources.
     for (;;) {
-      asm volatile("wfi");
+      // In practice we should execute this loop only once because
+      // if we yield while zombie then we can't get scheduled again.
+      // The loop is just a safety measure to keep damaged contained
+      // if something goes wrong elsewhere.
+      mtstate->set_thread_zombie(tracker);
+      tracker->complete = true; // must not be made runnable again
+      yield_timeslice(mtstate);
     }
   }
 
   // If we get here then our thread is joinable and so we just need to
   // remove it from all ready/wait lists and yield our timeslice, and
   // then our state will hang around until another thread joins with this
-  // one and cleans up its resources.
-  auto mtstate = app.multithreading_state();
+  // one, at which point _that_ thread will be responsible for marking
+  // this one as a zombie so it can be cleaned up.
   {
     auto d = disable_interrupts();
     attrib->retval = retval;
-    auto tracker = (ThreadTracker *)attrib->platform_data;
     tracker->waiters.detach(d);
     tracker->timed_waiters.detach(d);
-    tracker->complete = true;
-    // Any other threads that were waiting for this one to terminate get
-    // re-awakened now, with their a0 set to 1 to signal that they they
-    // got what they were waiting for without hitting a timeout.
-    for (auto current = tracker->exit_waiters.first(); current != nullptr;
-         current = tracker->exit_waiters.next(current)) {
-      mtstate->end_thread_wait(current, true);
-    }
-    yield_timeslice(
-        mtstate); // won't actually yield until we reenable interrupts
-    (void)d;      // interrupts re-enabled here
+    tracker->complete = true; // must not be made runnable again
+    // Any threads that were waiting on our completion now become runnable.
+    mtstate->end_thread_wait_list_success(&tracker->exit_waiters);
+    // The following won't actually yield until we reenable interrupts.
+    yield_timeslice(mtstate);
+    (void)d; // interrupts re-enabled here
   }
   // We removed ourselves from all waiting lists before yielding, so there
   // should be no way for the thread to become runnable again, but we'll
   // guard here just in case.
   for (;;) {
-    asm volatile("wfi");
+    yield_timeslice(mtstate);
   }
 }
 
@@ -689,6 +776,17 @@ int AppProperties::ensure_multithreaded() {
   idle_state->sp = (uint64_t)idle_stack_sp;
   idle_state->gp = get_gp_register();
 
+  // The thread cleanup thread similarly starts with a ThreadState that will
+  // cause it to enter into cleanup_thread once it's activated.
+  auto cleanup_stack_sp =
+      &state->cleanup_stack[sizeof(state->cleanup_stack) & ~15];
+  state->cleanup.state =
+      (ThreadState *)(cleanup_stack_sp - sizeof(ThreadState));
+  auto cleanup_state = state->cleanup.state;
+  cleanup_state->pc = (uint64_t)&cleanup_thread;
+  cleanup_state->sp = (uint64_t)cleanup_stack_sp;
+  cleanup_state->gp = get_gp_register();
+
   // We'll need to make the main thread's attributes now look a little more
   // "realistic" so that our threading system can treat it the same as any
   // other thread.
@@ -750,8 +848,7 @@ static void insert_thread_list_item_time_wait(ThreadTracker *to_insert,
   // time than the one we're inserting and insert just before it, or place
   // our item at the tail of the list.
   auto current = list->first();
-  for (; current != nullptr;
-       current = list->next(current)) {
+  for (; current != nullptr; current = list->next(current)) {
     if (current->wake_time > wake_time) {
       // We'll insert before this one, then.
       auto insert_before = list->member_for_tracker(current);
@@ -765,7 +862,8 @@ static void insert_thread_list_item_time_wait(ThreadTracker *to_insert,
   insert_thread_list_item_before(to_insert_m, &list->head, d);
 }
 
-#pragma GCC diagnostic pop // no longer ignoring "-Wunneeded-internal-declaration"
+#pragma GCC diagnostic pop // no longer ignoring
+                           // "-Wunneeded-internal-declaration"
 
 template <size_t OFFSET>
 void ThreadList<OFFSET>::push_head(ThreadTracker *t,
@@ -844,12 +942,50 @@ void AppThreading::set_thread_runnable(ThreadTracker *t) {
   (void)d;
 }
 
-void AppThreading::end_thread_wait(ThreadTracker *t, bool succeeded) {
+void AppThreading::set_thread_zombie(ThreadTracker *t) {
   auto d = disable_interrupts();
   t->timed_waiters.detach(d);
-  this->runnable_threads.push_tail(t, d);
-  t->state->a[0] = succeeded ? 1 : 0;
+  this->zombie_threads.push_tail(t, d);
   (void)d;
+}
+
+ThreadTracker *
+AppThreading::end_thread_wait_success(ThreadTracker *t,
+                                      ThreadWaitList *from_list) {
+  auto d = disable_interrupts();
+  auto ret = from_list->next(t);
+  t->timed_waiters.detach(d);
+  this->runnable_threads.push_tail(t, d);
+  t->state->a[0] = 1; // return value from the explicit yield function
+  (void)d;
+  return ret;
+}
+
+void AppThreading::end_thread_wait_list_success(ThreadWaitList *from_list) {
+  auto d = disable_interrupts();
+  auto current = from_list->first();
+  while (current != nullptr) {
+    // We must decide the next thread before we make any other changes because
+    // making "current" runnable will remove it from the list implicitly.
+    auto next = from_list->next(current);
+    current->timed_waiters.detach(d);
+    this->runnable_threads.push_tail(current, d);
+    current->state->a[0] = 1; // return value from the explicit yield function
+    current = next;
+  }
+  (void)d;
+}
+
+ThreadTracker *
+AppThreading::end_thread_wait_timeout(ThreadTracker *t,
+                                      ThreadTimedWaitList *from_list) {
+  auto d = disable_interrupts();
+  auto ret = from_list->next(t);
+  t->timed_waiters.detach(d);
+  this->runnable_threads.push_tail(t, d);
+  t->state->a[0] = 0; // return value from the explicit yield function
+  (void)d;
+  return ret;
 }
 
 } // namespace LIBC_NAMESPACE_DECL

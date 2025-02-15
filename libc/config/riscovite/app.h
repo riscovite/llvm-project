@@ -194,7 +194,8 @@ template <size_t LIST_MEMBER_OFFSET> struct ThreadList {
   void push_head(ThreadTracker *t, const InterruptsDisabled &d);
   void push_tail(ThreadTracker *t, const InterruptsDisabled &d);
   bool push_sole_member(ThreadTracker *t, const InterruptsDisabled &d);
-  void insert_with_wake_time(ThreadTracker *t, uint64_t wake_time, const InterruptsDisabled &d);
+  void insert_with_wake_time(ThreadTracker *t, uint64_t wake_time,
+                             const InterruptsDisabled &d);
   void remove(ThreadTracker *t, const InterruptsDisabled &d);
 };
 
@@ -346,7 +347,7 @@ struct AppThreading {
   // The thread that is currently running.
   ThreadTracker *running_thread;
 
-  // A singly-linked list of threads that are ready to run, or nullptr if no
+  // A doubly-linked list of threads that are ready to run, or nullptr if no
   // threads are ready to run.
   //
   // Any thread that's in this list must have its [ThreadState] object
@@ -360,7 +361,7 @@ struct AppThreading {
   // in running_thread, and there are therefore no runnable threads.
   ThreadWaitList runnable_threads;
 
-  // A singly-linked list of threads that want to become runnable again at
+  // A doubly-linked list of threads that want to become runnable again at
   // a particular time in the future, in order of requested wakeup time with
   // the soonest first.
   //
@@ -368,6 +369,15 @@ struct AppThreading {
   // synchronization primitive. If it is then it could be awakened by either
   // the wait queue this time-wait list, depending on which event occurs first.
   ThreadTimedWaitList time_waiting_threads;
+
+  // A doubly-linked list of threads that have finished executing but whose
+  // resources have not yet been freed.
+  //
+  // If this thread is not empty during a thread switch then control transfers
+  // to the thread cleanup thread, which then empties this list by disposing
+  // of each thread's resources before yielding control back to the main
+  // scheduler.
+  ThreadWaitList zombie_threads;
 
   // The handle number of a software interrupt object used to force immediate
   // entry into the thread-switching code. The thread-switching code can also
@@ -388,11 +398,21 @@ struct AppThreading {
   // the idle_stack field, once initialized.
   ThreadTracker idle;
 
+  // ThreadTracker for the thread cleanup thread, which takes control whenever
+  // there's at least one thread in zombie_threads during a task switch.
+  ThreadTracker cleanup;
+
   // A small buffer used as stack space for the idle thread.
   // This contains its ThreadState when it's suspended, along with any other
   // small content that might be placed in the stack frame of the idle thread's
   // function by the compiler.
   alignas(16) char idle_stack[64 + sizeof(ThreadState)];
+
+  // A small buffer used as stack space for the cleanup thread.
+  // This contains its ThreadState when it's suspended, along with any other
+  // small content that might be placed in the stack frame of the cleanup
+  // thread's function by the compiler.
+  alignas(16) char cleanup_stack[64 + sizeof(ThreadState)];
 
   LIBC_INLINE ThreadTracker *next_runnable() {
     return this->runnable_threads.first();
@@ -400,13 +420,58 @@ struct AppThreading {
   LIBC_INLINE ThreadTracker *next_time_waiter() {
     return this->time_waiting_threads.first();
   }
+  LIBC_INLINE bool have_zombies(InterruptsDisabled &d) {
+    (void)d;
+    return this->zombie_threads.first() != nullptr;
+  }
+  // This function must be called only from the thread cleanup thread, since
+  // it assumes that it has exclusive control over the zombie list.
+  LIBC_INLINE ThreadTracker *take_next_zombie() {
+    auto ret = this->zombie_threads.first();
+    if (ret == nullptr) {
+      return nullptr;
+    }
+    // We're going to immediately remove this item from the zombie list
+    // because the caller MUST clean it up after retrieving it.
+    auto m = &ret->waiters;
+    m->next->prev = m->prev;
+    m->prev->next = m->next;
+    m->next = nullptr;
+    m->prev = nullptr;
+    return ret;
+  }
 
   void set_thread_waiting(ThreadTracker *t, ThreadWaitList *wait_list);
   void set_thread_waiting_deadline(ThreadTracker *t, ThreadWaitList *wait_list,
                                    uint64_t deadline);
   void set_thread_sleeping(ThreadTracker *t, uint64_t deadline);
   void set_thread_runnable(ThreadTracker *t);
-  void end_thread_wait(ThreadTracker *t, bool succeeded);
+  void set_thread_zombie(ThreadTracker *t);
+
+  // Sets up the given thread to return from an explicit yield with a
+  // successful result and marks it as runnable.
+  //
+  // The result is the given thread's successor in from_list, if any,
+  // because by the time this function returns the thread will no longer
+  // belong to that list.
+  ThreadTracker *end_thread_wait_success(ThreadTracker *t,
+                                         ThreadWaitList *from_list);
+
+  // Performs end_thread_wait_success on every thread in the given list,
+  // leaving the list empty.
+  //
+  // This function encapsulates the common case of traversing through all
+  // threads in a particular wait list and making them all runnable at once.
+  void end_thread_wait_list_success(ThreadWaitList *from_list);
+
+  // Sets up the given thread to return from an explicit yield with an
+  // unsuccessful (timeout) result and marks it as runnable.
+  //
+  // The result is the given thread's successor in from_list, if any,
+  // because by the time this function returns the thread will no longer
+  // belong to that list.
+  ThreadTracker *end_thread_wait_timeout(ThreadTracker *t,
+                                         ThreadTimedWaitList *from_list);
 };
 
 // Data structure which captures properties of a RISCovite application.
