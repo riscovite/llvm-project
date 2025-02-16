@@ -41,6 +41,9 @@ FileIOResult riscovite_file_read(File *f, void *buf, size_t size) {
 
 ErrorOr<off_t> riscovite_file_seek(File *f, off_t offset, int whence) {
   // TODO: Implement
+  (void)f;
+  (void)offset;
+  (void)whence;
   return ErrorOr<off_t>(cpp::unexpected(EINVAL));
 }
 

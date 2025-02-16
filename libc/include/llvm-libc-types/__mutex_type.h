@@ -22,7 +22,16 @@ typedef struct {
 #ifdef __linux__
   __futex_word __ftxw;
 #elif defined(__RISCovite__)
-  // FIXME: decide what fields/types we're going to use for tracking the mutex
+  // This is really just to reserve some extra space for the internal
+  // Mutex on this platform.
+  // apparentlymart NOTE: the unconditionally-declared fields above seem
+  // like they were originally intended to match the Linux implementation
+  // of Mutex, but there's now an additional unsigned char is_pshared
+  // there so it doesn't actually match anymore. I'm not sure exactly what
+  // the goal was here but the following is assuming that the exact
+  // layout of __mutex_type does not matter as long as it's at least
+  // as big as the platform's Mutex type.
+  char __padding[8];
 #else
 #error "Mutex type not defined for the target platform."
 #endif

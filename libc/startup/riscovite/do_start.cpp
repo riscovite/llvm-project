@@ -6,18 +6,20 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "startup/riscovite/auxvec.h"
 #include "startup/riscovite/do_start.h"
 #include "config/riscovite/app.h"
+#include "src/__support/OSUtil/io.h"
+#include "src/__support/OSUtil/riscovite/io.h"
 #include "src/__support/OSUtil/syscall.h"
 #include "src/__support/macros/config.h"
-#include "src/__support/OSUtil/riscovite/io.h"
 #include "src/__support/threads/thread.h"
 #include "src/stdlib/atexit.h"
 #include "src/stdlib/exit.h"
 #include "src/unistd/environ.h"
+#include "startup/riscovite/auxvec.h"
 
 #include <stdint.h>
+#include <stdio.h>
 
 extern "C" int main(int argc, char **argv, char **envp);
 
@@ -39,14 +41,14 @@ using InitCallback = void(int, char **, char **);
 using FiniCallback = void(void);
 
 typedef struct {
-    uint32_t p_type;
-    uint32_t p_flags;
-    uint64_t p_offset;
-    uint64_t p_vaddr;
-    uint64_t p_paddr;
-    uint64_t p_filesz;
-    uint64_t p_memsz;
-    uint64_t p_align;
+  uint32_t p_type;
+  uint32_t p_flags;
+  uint64_t p_offset;
+  uint64_t p_vaddr;
+  uint64_t p_paddr;
+  uint64_t p_filesz;
+  uint64_t p_memsz;
+  uint64_t p_align;
 } Elf64_Phdr;
 #define PT_PHDR 6
 #define PT_TLS 7
@@ -157,14 +159,14 @@ void teardown_main_tls() { cleanup_tls(tls.addr, tls.size); }
     // allocation on a single-thread-only program.
     void *tls_area = __builtin_alloca(tls_alloc_size);
     init_tls(tls_area, tls);
-    tls.addr = 0; // we used automatic storage for this, so we mustn't free() it later
   }
   if (tls.size != 0 && !set_thread_ptr(tls.tp)) {
     syscall_impl<long>(0x800 /* EXIT */, 1);
   }
 
   self.attrib = &main_thread_attrib;
-  main_thread_attrib.atexit_callback_mgr = internal::get_thread_atexit_callback_mgr();
+  main_thread_attrib.atexit_callback_mgr =
+      internal::get_thread_atexit_callback_mgr();
 
   atexit(call_fini_array_callbacks);
 

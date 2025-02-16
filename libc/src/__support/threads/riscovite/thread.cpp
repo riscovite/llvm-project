@@ -12,15 +12,18 @@
 #include "src/__support/CPP/new.h"
 #include "src/__support/CPP/string_view.h"
 #include "src/__support/CPP/stringstream.h"
+#include "src/__support/OSUtil/io.h"
 #include "src/__support/OSUtil/riscovite/sysfuncs.h"
 #include "src/__support/OSUtil/syscall.h"
 #include "src/__support/common.h"
 #include "src/__support/error_or.h"
 #include "src/__support/macros/config.h"
+#include "src/__support/threads/riscovite/mutex.h"
 #include "src/errno/libc_errno.h" // For error macros
 
 #include <assert.h>
 #include <stdint.h>
+#include <stdio.h>
 
 namespace LIBC_NAMESPACE_DECL {
 
@@ -215,6 +218,62 @@ static LIBC_INLINE void yield_timeslice(AppThreading *s) {
   syscall_impl<uint64_t>(SYS_SET_INTERRUPT_PENDING, suspend_intr_hnd_num, 1);
 }
 
+bool wait_current_thread_raw() {
+  constexpr uint64_t SYS_SET_INTERRUPT_PENDING =
+      syscall_iface_func_num(0, 0x001);
+  auto s = app.multithreading_state();
+  uint64_t suspend_intr_hnd_num = s->thread_switch_hnd_num;
+  uint64_t result;
+  // This is written as inline assembly because the code which will eventually
+  // re-awaken the thread relies directly on the ABI/calling-convention to
+  // return the result -- the resumer literally modifies our state to change
+  // the value of the a0 register -- and so it's considerably easier for us
+  // to cooperate with that behavior in hand-written assembly.
+  asm volatile(
+      // We need to yield with our a0 acting as the wait
+      // status tracker, but we also need a0 to make the
+      // system call to yield, so we cheat here and set
+      // up the yield with interrupts disabled and then
+      // only reenable them once we're ready to use a0
+      // as the status tracker.
+      "csrw 0x800, 0\n\t"          // disable interrupts while we set things up
+      "li a7, %[SYS_INT_PEND]\n\t" // set up funcnum for system call
+      "mv a0, %[HND_NUM]\n\t"      // set up argument 0 for system call
+      "li a1, 1\n\t"               // set up argument 1 for system call
+      "ecall\n\t" // will yield timeslice once we reenable interrupts
+      // Now we'll set up a0 and a1 in the way we want to
+      // leave them in our ThreadState when we yield,
+      // so that once we get resumed we can use the a0
+      // modified by whatever resumed us to decide the
+      // final status.
+      "li a1, 15\n\t" // set a1 to not be one of the two resume values
+      "mv a0, a1\n\t" // a0 is initially equal to a1
+      "\n1:\n\t"
+      "csrw 0x800, 1\n\t" // re-enable interrupts, and thus yield
+      // Execution should pause here because our earlier yield signal should
+      // take effect as soon as we re-enable interrupts. However, we use
+      // a loop here to account for weirder situations like if the priority
+      // floor is currently nonzero and some other interrupt handler is going
+      // to change that at a future point and thus allow us to finally yield
+      // and let the event we're waiting for potentially occur.
+      "bne a0, a1, 2f\n\t"     // jump to end of loop if a0 was changed
+      "csrrw s0, 0x800, 0\n\t" // disable interrupts while we wfi
+      "wfi\n\t"                // dwell here until an interrupt is pending
+      "j 1b\n\t"               // jump to start of loop to spin-wait some more
+      "\n2:\n\t"
+      // Once we get here, a0 should either be either 1 or 0, where 1
+      // indicates that the wait-event occurred while 0 indicates that
+      // the thread's time-wait deadline was reached before the event
+      // occurred. Either way we'll copy that value into the result
+      // register so that our C function will return it.
+      "mv %[RESULT], a0"
+      : [RESULT] "=r"(result)
+      : [HND_NUM] "r"(suspend_intr_hnd_num), [SYS_INT_PEND] "i"(
+                                                 SYS_SET_INTERRUPT_PENDING)
+      : "a0", "a1", "s0", "a7");
+  return result != 0;
+}
+
 // The implementation of the "idle thread" that becomes current whenever
 // there are no normal runnable threads.
 __attribute__((noreturn)) void idle_thread() {
@@ -378,17 +437,17 @@ static ThreadState *switch_threads(ThreadState *current_state,
       preempt_time = timed_wait_time;
     }
 
-    auto result =
-        syscall_impl<uint64_t>(RISCOVITE_SYS_SET_TIMER_INTERRUPT, preempt_time,
-                               (uint64_t)&thread_switching_interrupt_handler<
-                                   preempt_thread_switch_handler>,
-                               (uint64_t)PREEMPT_INTERRUPT_PRIORITY);
+    auto result = syscall_impl<uint64_t>(
+        RISCOVITE_SYS_SET_TIMER_INTERRUPT, (uint64_t)preempt_time,
+        (uint64_t)&thread_switching_interrupt_handler<
+            preempt_thread_switch_handler>,
+        (uint64_t)PREEMPT_INTERRUPT_PRIORITY);
     (void)result; // Can't really do anything if the timer setup fails, but it
                   // ought not to
   } else {
     // Clear any timer we might have configured previously.
-    auto result =
-        syscall_impl<uint64_t>(RISCOVITE_SYS_SET_TIMER_INTERRUPT, 0, 0, 0);
+    auto result = syscall_impl<uint64_t>(RISCOVITE_SYS_SET_TIMER_INTERRUPT,
+                                         (uint64_t)0, (uint64_t)0, (uint64_t)0);
     (void)result; // Can't really do anything if the timer setup fails, but it
                   // ought not to
   }
@@ -949,16 +1008,36 @@ void AppThreading::set_thread_zombie(ThreadTracker *t) {
   (void)d;
 }
 
-ThreadTracker *
-AppThreading::end_thread_wait_success(ThreadTracker *t,
-                                      ThreadWaitList *from_list) {
+void AppThreading::wait_for_event(ThreadWaitList *wait_list) {
+  auto current = (ThreadTracker *)self.attrib->platform_data;
+  this->set_thread_waiting(current, wait_list);
+  // The following function does not return until some other thread or
+  // interrupt handler moves this thread back from wait_list into the
+  // runnable list.
+  wait_current_thread_raw();
+}
+
+bool AppThreading::wait_for_event_deadline(ThreadWaitList *wait_list,
+                                           uint64_t deadline) {
+  auto current = (ThreadTracker *)self.attrib->platform_data;
+  this->set_thread_waiting_deadline(current, wait_list, deadline);
+  // The following function does not return until some other thread or
+  // interrupt handler moves this thread back from wait_list into the
+  // runnable list. It returns false if it was made runnable by reaching
+  // the deadline, or true if it was made runnable by the occurrence of
+  // whatever event wait_list represents.
+  return wait_current_thread_raw();
+}
+
+void AppThreading::end_thread_wait_success(ThreadWaitList *from_list) {
   auto d = disable_interrupts();
-  auto ret = from_list->next(t);
-  t->timed_waiters.detach(d);
-  this->runnable_threads.push_tail(t, d);
-  t->state->a[0] = 1; // return value from the explicit yield function
+  auto t = from_list->first();
+  if (t != nullptr) {
+    t->timed_waiters.detach(d);
+    this->runnable_threads.push_tail(t, d);
+    t->state->a[0] = 1; // return value from the explicit yield function
+  }
   (void)d;
-  return ret;
 }
 
 void AppThreading::end_thread_wait_list_success(ThreadWaitList *from_list) {
@@ -986,6 +1065,66 @@ AppThreading::end_thread_wait_timeout(ThreadTracker *t,
   t->state->a[0] = 0; // return value from the explicit yield function
   (void)d;
   return ret;
+}
+
+MutexError Mutex::lock_impl(cpp::optional<uint64_t> deadline) {
+  auto mtstate = app.multithreading_state();
+  if (mtstate == nullptr) {
+    // Not actually multithreaded, so if we manage to get here then
+    // the main thread seems to be trying to re-lock a mutex it
+    // already locked.
+    return MutexError::BAD_LOCK_STATE;
+  }
+  auto t = (ThreadTracker *)self.attrib->platform_data;
+
+  // If the lock was already held then we have some more work to do,
+  // and we need to make sure we're not interrupted while doing it.
+  {
+    auto d = disable_interrupts();
+    // We need to double-check the lock status now, in case it got
+    // unlocked between our original test and us disabling interrupts.
+    auto lock_count = 0;
+    if (this->lock_count.compare_exchange_strong(lock_count, 1)) {
+      // Early return re-enables interrupts by destroying d.
+      return MutexError::NONE;
+    }
+    if (lock_count < 0 || lock_count > 1) {
+      // In our current implementation there should only ever be zero or one
+      // active locks, so anything else suggests that our state has become
+      // corrupted somehow.
+      return MutexError::BAD_LOCK_STATE;
+    }
+
+    // Possibly need delayed init of the waiter list for Mutex instances
+    // in global statics or thread-locals, which therefore don't run
+    // init during construction.
+    this->waiters.ensure_init(d);
+
+    // If we get here then the mutex is definitely currently locked
+    // and so we need to use the wait-list to sleep until it becomes
+    // unlocked again.
+    //
+    // We can't use the mtstate->wait_for_event helper here because
+    // we need to perform our list manipulations with interrupts still
+    // disabled but we can't yield our timeslice until interrupts
+    // are re-enabled. Therefore we're doing essentially the same
+    // thing as wait_for_event here but with the yield part happening
+    // below only once we've set up the wait list.
+    if (deadline) {
+      mtstate->set_thread_waiting_deadline(t, &this->waiters, *deadline);
+    } else {
+      mtstate->set_thread_waiting(t, &this->waiters);
+    }
+    (void)d; // interrupts re-enabled here
+  }
+  // The following function will not return until this thread
+  // becomes runnable again, which can only happen when
+  // another thread calls "unlock".
+  if (wait_current_thread_raw()) {
+    return MutexError::NONE;
+  } else {
+    return MutexError::TIMEOUT;
+  }
 }
 
 } // namespace LIBC_NAMESPACE_DECL

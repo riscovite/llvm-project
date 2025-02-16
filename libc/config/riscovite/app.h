@@ -57,6 +57,20 @@ LIBC_INLINE InterruptsDisabled disable_interrupts() {
   return InterruptsDisabled();
 }
 
+// The lowest-level building block for putting a thread to sleep while it
+// waits for some event to occur.
+//
+// Once the thread becomes runnable again, returns true if the event-wait
+// succeeded, or false if the timeout deadline was reached before the event
+// occurred.
+//
+// Before calling this function the thread must have removed itself from the
+// runnable list and added itself to at least one of a normal event wait list
+// or the system's time-wait list, such that it will eventually be made
+// runnable again with the a0 return value register changed to 1 to signal
+// "event occurred", or "0" to signal "timeout reached".
+bool wait_current_thread_raw();
+
 // The saved state for a currently-suspended thread.
 //
 // Most of this structure is actually just the exception stack frame generated
@@ -137,11 +151,18 @@ struct ThreadListMember {
   ThreadListMember *prev;
   ThreadListMember *next;
 
+  LIBC_INLINE constexpr ThreadListMember() : prev(nullptr), next(nullptr) {}
+
+  LIBC_INLINE constexpr ThreadListMember(ThreadListMember &self)
+      : prev(&self), next(&self) {}
+
   void detach(const InterruptsDisabled &d);
 };
 
 // Forward-declaration because ThreadTracker and ThreadList refer to each other.
 struct __attribute__((aligned(16))) ThreadTracker;
+
+enum ThreadListDelayInit { THREAD_LIST_DELAY_INIT };
 
 // The head of a double-linked list of [ThreadTracker] objects.
 //
@@ -156,14 +177,24 @@ template <size_t LIST_MEMBER_OFFSET> struct ThreadList {
   // of the list.
   ThreadListMember head;
 
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+  LIBC_INLINE constexpr ThreadList() : head(this->head) {}
+#pragma GCC diagnostic pop
+
+  LIBC_INLINE constexpr ThreadList([[maybe_unused]] ThreadListDelayInit delay) : head() {}
+
   LIBC_INLINE void init() {
-    // An empty list is represented by the two head fields pointing back
-    // to the head again.
     this->head.next = &this->head;
     this->head.prev = &this->head;
   }
 
-  LIBC_INLINE ThreadList() { this->init(); }
+  LIBC_INLINE void ensure_init(InterruptsDisabled &d) {
+    if (this->head.next == nullptr) {
+      this->init();
+    }
+    (void)d;
+  }
 
   // This must be called only with a ThreadListMember that actually represents
   // a list item, and NEVER with the special member in "head".
@@ -448,17 +479,38 @@ struct AppThreading {
   void set_thread_runnable(ThreadTracker *t);
   void set_thread_zombie(ThreadTracker *t);
 
-  // Sets up the given thread to return from an explicit yield with a
-  // successful result and marks it as runnable.
+  // Add the current thread to the given waitlist without any deadline and
+  // then yield to allow other threads to run. (This is one of our low-level
+  // building blocks for synchronization primitives.)
   //
-  // The result is the given thread's successor in from_list, if any,
-  // because by the time this function returns the thread will no longer
-  // belong to that list.
-  ThreadTracker *end_thread_wait_success(ThreadTracker *t,
-                                         ThreadWaitList *from_list);
+  // The thread that called this function will not run again until something
+  // on another thread or in an interrupt handler moves the thread back from
+  // this wait list into the runnable list.
+  void wait_for_event(ThreadWaitList *wait_list);
 
-  // Performs end_thread_wait_success on every thread in the given list,
-  // leaving the list empty.
+  // Add the current thread to the given waitlist with the given deadline and
+  // then yield to allow other threads to run. (This is one of our low-level
+  // building blocks for synchronization primitives.)
+  //
+  // The thread that called this function will not run again either something
+  // on another thread or in an interrupt handler moves the thread back from
+  // this wait list into the runnable list, or until the deadline time is
+  // reached and thus the main thread scheduler will force it runnable again.
+  //
+  // Returns true if it returned due to the occurance of the event associated
+  // with the given wait list, or false if it returned due to reaching the
+  // deadline before the event occurred.
+  bool wait_for_event_deadline(ThreadWaitList *wait_list, uint64_t deadline);
+
+  // Sets up the first thread in the given list, if any, to return from
+  // an explicit yield with a successful result, and marks it as runnable.
+  //
+  // After this function returns, the resumed thread is no longer in the
+  // wait list and any deadline it was waiting for is cancelled.
+  void end_thread_wait_success(ThreadWaitList *from_list);
+
+  // Performs the effect of end_thread_wait_success on every thread in the
+  // given list, leaving the list empty.
   //
   // This function encapsulates the common case of traversing through all
   // threads in a particular wait list and making them all runnable at once.
